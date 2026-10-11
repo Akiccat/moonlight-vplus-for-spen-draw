@@ -2387,4 +2387,5 @@ Tap again to replace it.</string>
     <string name="summary_fec_fixed">Your fixed percentage takes priority on a compatible host. Applied on the next connection.</string>
     <string name="numeric_parameter_range">Enter a valid value from %1$s to %2$s %3$s.</string>
     <string name="pyrowave_negotiation_fallback">PyroWave negotiation failed. Falling back to %1$s.</string>
+    <string name="pc_card_usb_badge">[USB]</string>
 </resources>

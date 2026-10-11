@@ -44,10 +44,12 @@ internal class BitrateCardController(
     }
 
     companion object {
-        const val MAX_PROGRESS = 59
-        const val PYROWAVE_MAX_PROGRESS = 83
+        // SuperSun: 100..800 Mbps，每档 20 Mbps。有线 USB 链路上同样需要到 800 Mbps，
+        // 因此不再按「是否 PyroWave 会话」区分上限（上游原为 59 / 83）。
+        const val MAX_PROGRESS = 84
+        const val PYROWAVE_MAX_PROGRESS = 84
         private const val PREF_HAPTIC_MODE = "bitrate_seekbar_haptic_mode"
-        private val SEGMENT_BOUNDARIES = setOf(0, 9, 24, 39, 49, MAX_PROGRESS)
+        private val SEGMENT_BOUNDARIES = setOf(0, 9, 24, 39, 49, 59, 69, MAX_PROGRESS)
 
         fun maxProgressFor(supportsExtendedBitrate: Boolean): Int {
             return if (supportsExtendedBitrate) PYROWAVE_MAX_PROGRESS else MAX_PROGRESS
@@ -71,8 +73,7 @@ internal class BitrateCardController(
                 boundedProgress <= 24 -> 5000 + (boundedProgress - 9) * 1000
                 boundedProgress <= 39 -> 20000 + (boundedProgress - 24) * 2000
                 boundedProgress <= 49 -> 50000 + (boundedProgress - 39) * 5000
-                boundedProgress <= MAX_PROGRESS -> 100000 + (boundedProgress - 49) * 10000
-                else -> 200000 + (boundedProgress - MAX_PROGRESS) * 25000
+                else -> 100000 + (boundedProgress - 49) * 20000
             }
         }
 
@@ -82,8 +83,7 @@ internal class BitrateCardController(
                 kbps <= 20000 -> 9 + (kbps - 5000 + 500) / 1000
                 kbps <= 50000 -> 24 + (kbps - 20000 + 1000) / 2000
                 kbps <= 100000 -> 39 + (kbps - 50000 + 2500) / 5000
-                kbps <= 200000 -> 49 + (kbps - 100000 + 5000) / 10000
-                else -> MAX_PROGRESS + (kbps - 200000 + 12500) / 25000
+                else -> 49 + (kbps - 100000 + 10000) / 20000
             }
             return unboundedProgress.coerceIn(0, maxProgress)
         }

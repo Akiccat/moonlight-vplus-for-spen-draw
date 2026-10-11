@@ -79,6 +79,20 @@ class ComputerManagerService : Service() {
 
     private lateinit var idManager: IdentityManager
     private val pollingTuples = LinkedList<PollingTuple>()
+
+    /** Guards against overlapping USB card probes; see requestUsbLinkCard(). */
+    private val usbCardJobActive = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Last successful USB probe, and when it ran.
+     *
+     * The post-poll hook fires on every poll of every card, i.e. several times a
+     * second. Without this the TCP probe to the PC would run just as often, which
+     * is pointless traffic and shows up as a burst of connects every polling
+     * period. The DHCP lease cannot move faster than this anyway.
+     */
+    private var lastUsbProbeMs = 0L
+    private var lastUsbPeerAddress: String? = null
     private val activePollFlights = ConcurrentHashMap<String, PollFlight>()
     private val recentPollResults = ConcurrentHashMap<String, RecentPoll>()
 
@@ -187,6 +201,18 @@ class ComputerManagerService : Service() {
             emitComputerUpdate(details)
         }
 
+        // A poll is what first reveals the host's uuid, and the USB card is derived
+        // from it. So this is the earliest point the USB card can be built for a
+        // host we did not already know about.
+        //
+        // Dispatched rather than run inline: UsbTetherProbe.probe() opens a TCP
+        // connection with a 1.5s timeout, and runPoll() is on the caller's critical
+        // path (it runs inside a runInterruptible that holds the tuple's network
+        // lock). Blocking there would stall every other card's polling too.
+        if (!details.isUsbLink && details.uuid != null && details.state == ComputerDetails.State.ONLINE) {
+            requestUsbLinkCard()
+        }
+
         releaseLocalDatabaseReference()
         return true
     }
@@ -194,6 +220,11 @@ class ComputerManagerService : Service() {
     private fun startPollingInternal() {
         pollingActive = true
         discoveryBinder?.startDiscovery(MDNS_QUERY_PERIOD_MS)
+
+        // Before polling starts, give the USB tethering link its own card. Doing it
+        // here (rather than in the mDNS callback) means the card exists on a cold
+        // start, before any discovery has run.
+        requestUsbLinkCard()
 
         synchronized(pollingTuples) {
             for (tuple in pollingTuples) {
@@ -206,6 +237,228 @@ class ComputerManagerService : Service() {
                     tuple.job = createPollingJob(tuple)
                 }
             }
+        }
+    }
+
+    /**
+     * Runs [maybeAddUsbLinkComputer] off the caller's thread and coalesces bursts.
+     *
+     * Two callers (startPolling and post-poll) can fire in quick succession; without
+     * coalescing the second run would probe the same address again and could race
+     * with the first over the same tuple.
+     */
+    private fun requestUsbLinkCard() {
+        if (!usbCardJobActive.compareAndSet(false, true)) return
+        serviceScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    maybeAddUsbLinkComputer()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                LimeLog.warning("USB link card update failed: ${e.message}")
+            } finally {
+                usbCardJobActive.set(false)
+            }
+        }
+    }
+
+    /**
+     * Creates (or refreshes) a second card for the PC reachable over USB.
+     *
+     * Why a derived uuid is required: addTuple() de-duplicates on uuid, and
+     * runPoll() looks the row up by uuid too. A USB card carrying the host's real
+     * uuid would therefore be folded into the WiFi card -- which is exactly what
+     * an earlier attempt did, producing one card whose address silently flipped
+     * between the two links.
+     *
+     * The derived id keeps the two apart while remaining deterministic, so the USB
+     * card is stable across restarts and keeps its own database row (and therefore
+     * its own certificate) without a second pairing.
+     *
+     * The card holds ONLY the USB address. That matters: parallelPollPc() races
+     * every candidate address and keeps the fastest, so a USB card that also
+     * carried the WiFi address could quietly fall back to WiFi -- and the user
+     * would be back to the 40 MB/s problem while looking at a card labelled USB.
+     */
+    private fun maybeAddUsbLinkComputer() {
+        val now = SystemClock.elapsedRealtime()
+        val cachedAddress = lastUsbPeerAddress
+
+        // How long to wait before probing again. The full window applies only once
+        // the card actually exists: the probe succeeds on the very first call of a
+        // cold start (the tether link is up) but the card cannot be built yet,
+        // because the host uuid only arrives with the first successful poll. Using
+        // the long window there would leave the USB card missing for 15s with no
+        // explanation, so an unbuilt card retries on the poll cadence instead.
+        val cardExists = synchronized(pollingTuples) {
+            pollingTuples.any { it.computer.isUsbLink }
+        }
+        val minInterval = if (cardExists) USB_PROBE_MIN_INTERVAL_MS else USB_PROBE_RETRY_MS
+
+        if (cachedAddress != null && now - lastUsbProbeMs < minInterval) {
+            if (cachedAddress.isNotEmpty()) {
+                applyUsbLinkCard(ComputerDetails.AddressTuple(cachedAddress, NvHTTP.DEFAULT_HTTP_PORT))
+            }
+            return
+        }
+        lastUsbProbeMs = now
+
+        val usbPeer = UsbTetherProbe.probe(this)
+        lastUsbPeerAddress = usbPeer?.address
+
+        if (usbPeer == null || usbPeer.linkUpButNoPeer) {
+            removeStaleUsbLinkComputer()
+            return
+        }
+
+        applyUsbLinkCard(ComputerDetails.AddressTuple(usbPeer.address, NvHTTP.DEFAULT_HTTP_PORT))
+    }
+
+    /**
+     * Creates or refreshes the USB card for [usbAddress].
+     *
+     * Split out of the probe so the rate-limited path can rebuild the card without
+     * touching the network again.
+     */
+    private fun applyUsbLinkCard(usbAddress: ComputerDetails.AddressTuple) {
+
+        // Find the WiFi/primary card for this host. The USB card mirrors it, so it
+        // needs a host to mirror: without one there is nothing to be a second card
+        // *of*, and the user has not added this PC manually yet.
+        val primary = synchronized(pollingTuples) {
+            pollingTuples.firstOrNull { !it.computer.isUsbLink }
+        }
+
+        // The host uuid is null until the first poll returns (it comes from the
+        // server), so on a cold start there is nothing to derive from yet. Deriving
+        // from a placeholder would mint "usb:unknown-host" and, because the derived
+        // uuid must stay stable, never fix it afterwards. Wait for the real one --
+        // the next startPolling() calls this again, by which point it is known.
+        val hostUuid = primary?.computer?.uuid
+        if (hostUuid.isNullOrEmpty()) {
+            LimeLog.info("USB link present (${usbAddress.address}) but the host uuid is not known yet; deferring USB card")
+            return
+        }
+
+        val usbDetails = ComputerDetails()
+        usbDetails.uuid = usbUuidFor(hostUuid)
+        usbDetails.name = primary?.computer?.name ?: "PC (USB)"
+        usbDetails.isUsbLink = true
+        // Only the USB address. See the note above: adding more would let
+        // parallelPollPc() pick a slower address and defeat the point.
+        usbDetails.localAddress = usbAddress
+        usbDetails.manualAddress = usbAddress
+        usbDetails.activeAddress = usbAddress
+        usbDetails.availableAddresses = ArrayList(listOf(usbAddress))
+        // Same host, same certificate, no second pairing.
+        usbDetails.serverCert = primary?.computer?.serverCert
+        usbDetails.httpsPort = primary?.computer?.httpsPort
+            ?: NvHTTP.DEFAULT_HTTPS_PORT
+        usbDetails.state = ComputerDetails.State.ONLINE
+
+        val existingUsb = synchronized(pollingTuples) {
+            pollingTuples.firstOrNull { it.computer.isUsbLink }
+        }
+
+        if (existingUsb != null) {
+            // Keep the live certificate/pair state; only the address can change
+            // (the DHCP lease moves when the cable is replugged).
+            existingUsb.computer.update(usbDetails)
+            existingUsb.computer.serverCert = usbDetails.serverCert ?: existingUsb.computer.serverCert
+            existingUsb.computer.isUsbLink = true
+            emitComputerUpdate(existingUsb.computer)
+            return
+        }
+
+        // Persist before polling so runPoll() finds a row by uuid and does not
+        // treat the card as unknown.
+        if (!getLocalDatabaseReference()) return
+        try {
+            if (primary != null && primary.computer.serverCert != null &&
+                usbDetails.serverCert == null) {
+                usbDetails.serverCert = primary.computer.serverCert
+            }
+            dbManager.updateComputer(usbDetails)
+        } finally {
+            releaseLocalDatabaseReference()
+        }
+
+        LimeLog.info("Added USB link card for ${usbDetails.name} at ${usbAddress.address} (uuid ${usbDetails.uuid})")
+        addTuple(usbDetails)
+    }
+
+    /**
+     * Deterministic uuid for the USB twin of [hostUuid].
+     *
+     * Derived rather than random so the card keeps its identity (and its stored
+     * certificate) across app restarts and cable replugs. The "usb:" prefix also
+     * makes these rows obvious in a database dump.
+     */
+    private fun usbUuidFor(hostUuid: String?): String {
+        val base = hostUuid ?: "unknown-host"
+        return USB_UUID_PREFIX + base
+    }
+
+    /**
+     * Whether a polled host uuid belongs to the card identified by [cardUuid].
+     *
+     * A USB card stores a derived id ("usb:" + the host's real uuid) so it does not
+     * collide with the primary card. The server, of course, only ever reports the
+     * real one -- so comparing the two verbatim would fail every time and the card
+     * would never come online. Strip the prefix before comparing.
+     */
+    private fun uuidMatchesHost(cardUuid: String, hostUuid: String?): Boolean {
+        if (hostUuid == null) return false
+        if (cardUuid == hostUuid) return true
+        val base = cardUuid.removePrefix(USB_UUID_PREFIX)
+        return base == hostUuid
+    }
+
+    /**
+     * Drops the USB card when the cable is gone.
+     *
+     * Leaving it would show a card that can never connect, which is worse than
+     * showing none -- the user would keep picking it and wondering why it fails.
+     *
+     * The UI has no "a computer vanished" signal: it only ever receives add/update
+     * events, and removal is an explicit user action (long-press -> remove). So the
+     * removal is emitted through the existing removeComputer() path rather than
+     * invented here, otherwise the stale card would stay on screen forever.
+     */
+    private fun removeStaleUsbLinkComputer() {
+        val stale = synchronized(pollingTuples) {
+            pollingTuples.filter { it.computer.isUsbLink }
+        }
+        if (stale.isEmpty()) return
+
+        for (tuple in stale) {
+            tuple.job?.cancel()
+            synchronized(pollingTuples) {
+                pollingTuples.remove(tuple)
+            }
+        }
+        LimeLog.info("Removed ${stale.size} USB link card(s): tether link is gone")
+
+        // Wipe the persisted row too, otherwise the next launch reloads it from
+        // the database and the card reappears before the probe has run.
+        for (tuple in stale) {
+            try {
+                removeComputerFromDb(tuple.computer)
+            } catch (e: Exception) {
+                LimeLog.warning("Failed to delete USB card row: ${e.message}")
+            }
+        }
+    }
+
+    /** Deletes a computer's row; separated so the USB path can log its own errors. */
+    private fun removeComputerFromDb(details: ComputerDetails) {
+        if (!getLocalDatabaseReference()) return
+        try {
+            dbManager.deleteComputer(details)
+        } finally {
+            releaseLocalDatabaseReference()
         }
     }
 
@@ -478,6 +731,13 @@ class ComputerManagerService : Service() {
                     details.ipv6Address = ComputerDetails.AddressTuple(computer.getIpv6Address()!!.hostAddress!!, computer.getPort())
                 }
 
+                // Discovery can report the host over the tether link, whose address
+                // belongs to the USB twin card. Adding it here would show the user a
+                // third card for one machine, flickering as the two race for it.
+                if (isDuplicateOfExistingCard(details)) {
+                    return
+                }
+
                 try {
                     if (!addComputerBlocking(details)) {
                         LimeLog.warning("Auto-discovered PC failed to respond: $details")
@@ -493,6 +753,53 @@ class ComputerManagerService : Service() {
                 e.printStackTrace()
             }
         }
+    }
+
+    /**
+     * True when [incoming] is a PC we already track under a different card.
+     *
+     * mDNS reports the host by its real uuid and by whatever address the responder
+     * happened to use. Over the USB tether that address is the tether one, which is
+     * exactly the address the USB twin card holds -- so discovery would look like a
+     * brand new PC and add a duplicate, giving the user three cards for one machine.
+     *
+     * Comparing on address (not uuid) is deliberate: the incoming details have the
+     * host's real uuid while the USB card holds a derived one, so a uuid compare
+     * would never match and the duplicate would slip through.
+     */
+    private fun isDuplicateOfExistingCard(incoming: ComputerDetails): Boolean {
+        val incomingAddresses = setOfNotNull(
+            incoming.localAddress?.toString(),
+            incoming.manualAddress?.toString(),
+            incoming.remoteAddress?.toString()
+        )
+        if (incomingAddresses.isEmpty()) return false
+
+        synchronized(pollingTuples) {
+            for (tuple in pollingTuples) {
+                val existing = tuple.computer
+                // Same machine already on the other cable: the USB twin. Reuse it
+                // instead of adding a card that would race it for the same address.
+                if (existing.isUsbLink) {
+                    val existingAddresses = setOfNotNull(
+                        existing.activeAddress?.toString(),
+                        existing.localAddress?.toString(),
+                        existing.manualAddress?.toString()
+                    )
+                    if (incomingAddresses.any { it in existingAddresses }) {
+                        LimeLog.info(
+                            "Ignoring mDNS duplicate: ${incomingAddresses.first()} is already on USB card ${existing.uuid}"
+                        )
+                        return true
+                    }
+                }
+                // Same uuid under a non-derived id: the ordinary card, already found.
+                if (!existing.isUsbLink && existing.uuid != null && existing.uuid == incoming.uuid) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     private fun addTuple(details: ComputerDetails) {
@@ -865,12 +1172,16 @@ class ComputerManagerService : Service() {
 
             val newDetails = http.getComputerDetails(isLikelyOnline)
 
-            if (newDetails.uuid == null) {
+            val hostUuid = newDetails.uuid
+            if (hostUuid == null) {
                 LimeLog.severe("Polling returned no UUID!")
                 timeoutManager?.recordFailure(address.address)
                 return null
             }
-            if (details.uuid != null && details.uuid != newDetails.uuid) {
+            // Local val, because `details.uuid` is a mutable property and Kotlin
+            // refuses to smart-cast it across the call.
+            val cardUuid = details.uuid
+            if (cardUuid != null && !uuidMatchesHost(cardUuid, hostUuid)) {
                 LimeLog.info("Polling returned the wrong PC!")
                 timeoutManager?.recordFailure(address.address)
                 return null
@@ -1104,6 +1415,11 @@ class ComputerManagerService : Service() {
         if (!getLocalDatabaseReference()) return
 
         for (computer in dbManager.getAllComputers()) {
+            // isUsbLink is not a stored column; it is derived from the uuid prefix
+            // written by usbUuidFor(). Without this a USB card reloaded from the
+            // database would come back looking like an ordinary WiFi entry and the
+            // UI would lose the distinction after every restart.
+            computer.isUsbLink = computer.uuid?.startsWith(USB_UUID_PREFIX) == true
             addTuple(computer)
         }
 
@@ -1313,6 +1629,13 @@ class ComputerManagerService : Service() {
     companion object {
         @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
         private val STUN_DISPATCHER = Dispatchers.IO.limitedParallelism(1)
+        /**
+         * Marks a computer row as the USB twin of a host. Kept in the uuid because
+         * that is the database primary key and the only value that survives a
+         * restart; see usbUuidFor().
+         */
+        private const val USB_UUID_PREFIX = "usb:"
+
         private const val SERVERINFO_POLLING_PERIOD_MS = 1500
         private const val APPVIEW_BACKGROUND_POLLING_PERIOD_MS: Long = 10000
         private const val APPLIST_POLLING_PERIOD_MS = 30000
@@ -1324,6 +1647,23 @@ class ComputerManagerService : Service() {
         private const val POLL_DATA_TTL_MS = 30000
         private const val POLL_RESULT_REUSE_MS: Long = 2500
         private const val COLLECTION_TIMEOUT_MS: Long = 2000
+
+        /**
+         * Floor on how often the USB tethering link is re-probed.
+         *
+         * The post-poll hook asks for a USB card on every poll of every card, which
+         * is several times a second. Re-running the TCP probe at that rate is
+         * pointless -- a DHCP lease cannot move that fast -- and it turns into a
+         * burst of connects on the tether link every polling period.
+         */
+        private const val USB_PROBE_MIN_INTERVAL_MS = 15_000L
+
+        /**
+         * Retry floor for the case where the link is up but the card does not exist
+         * yet -- i.e. the host uuid has not been learned. Matches the server-info
+         * polling period so the card appears as soon as the uuid lands.
+         */
+        private const val USB_PROBE_RETRY_MS = 1_500L
     }
 }
 

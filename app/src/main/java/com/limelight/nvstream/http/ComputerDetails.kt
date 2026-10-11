@@ -71,6 +71,18 @@ class ComputerDetails {
     var supportsDesktopSpecialApp = false
     var vddCapabilityVersion: Int? = null
 
+    /**
+     * True when this entry is the PC reached over the USB tethering link rather
+     * than over WiFi/LAN.
+     *
+     * The two share one machine, one server certificate and one pairing, but they
+     * are separate cards: the stream path is decided by the address we dial, and
+     * the two addresses sit on different subnets. So this flag exists purely to
+     * keep the UI honest about which cable a card represents -- it must never
+     * change how a connection is made.
+     */
+    var isUsbLink = false
+
     constructor()
 
     constructor(details: ComputerDetails) : this() {
@@ -98,7 +110,18 @@ class ComputerDetails {
     fun update(details: ComputerDetails) {
         this.state = details.state
         this.name = details.name
-        this.uuid = details.uuid
+        // isUsbLink is deliberately NOT copied. It describes the card, not the
+        // host: a poll result knows nothing about which cable this entry belongs
+        // to, and letting it clear the flag would silently relabel the card on the
+        // next successful poll.
+        //
+        // For the same reason a USB card keeps its derived uuid. A poll result
+        // carries the host's real uuid, and overwriting with it would collapse the
+        // USB twin onto the primary card on the very first successful poll --
+        // the exact collapse this feature exists to avoid.
+        if (!this.isUsbLink) {
+            this.uuid = details.uuid
+        }
 
         if (details.activeAddress != null) {
             this.activeAddress = details.activeAddress

@@ -364,6 +364,13 @@ class PcGridAdapter(
         if (isOnline && details.sunshineVersion != null && details.sunshineVersion?.endsWith("杂鱼") == true) {
             displayName += "⚡"
         }
+        // Mark which cable this card uses. Both cards are the same machine and the
+        // same pairing, so without this the only way to tell them apart is the
+        // address buried in the detail sheet -- and picking the wrong one silently
+        // sends the stream over WiFi, which is the thing this card exists to avoid.
+        if (details.isUsbLink) {
+            displayName += " " + context.getString(com.limelight.R.string.pc_card_usb_badge)
+        }
         txtView.text = displayName
         txtView.alpha = if (isOffline) 0.5f else 1.0f
         txtView.setTextColor(PcCardDecor.textColor(context, disabled = isOffline))

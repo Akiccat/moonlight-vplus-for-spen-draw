@@ -2295,4 +2295,5 @@
     <string name="summary_fec_fixed">客户端指定比例优先于兼容主机的 FEC 设置，下次连接生效。</string>
     <string name="numeric_parameter_range">请输入 %1$s–%2$s %3$s 内的有效数值。</string>
     <string name="pyrowave_negotiation_fallback">PyroWave 协商失败，已回退至 %1$s。</string>
+    <string name="pc_card_usb_badge">[USB]</string>
 </resources>
