@@ -17,16 +17,32 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
+#include <sys/system_properties.h>
 
 #define LOG_TAG "Framegen"
 #define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__))
 #define LOGW(...) ((void)__android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__))
 #define LOGE(...) ((void)__android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__))
+
+// ==== 临时诊断（2026-10-11）====================================================
+// 目的：定位 Turnip 在 PyroWave 路径上的确定性崩溃（kgsl_syncobj_merge 空指针，
+// fault addr 0x1b0，首帧成功、第二轮必崩）究竟发生在哪一次 Vulkan 调用上。
+// 在每步调用前打标记，崩溃时 logcat 里最后一条 PWVTRACE 就是凶手指认。
+// 用 ERROR 级别 + 独立 tag 便于过滤；打满 128 行后自动静默，不影响长时间运行。
+static int g_pwv_trace_lines = 0;
+#define PWV_TRACE(...)                                                                 \
+  do {                                                                                 \
+    if (g_pwv_trace_lines < 128) {                                                      \
+      ++g_pwv_trace_lines;                                                              \
+      __android_log_print(ANDROID_LOG_ERROR, "PWVTRACE", __VA_ARGS__);                  \
+    }                                                                                   \
+  } while (0)
 
 namespace FramegenPipeline {
 namespace {
@@ -239,19 +255,49 @@ struct PyrowaveVulkanDecoder::impl {
     VkExtent2D swapchain_extent{};
     std::vector<VkImage> swapchain_images;
     std::vector<VkImageView> swapchain_views;
-    VkSemaphore acquire_semaphore{VK_NULL_HANDLE};
-    VkSemaphore decode_complete_semaphore{VK_NULL_HANDLE};
+    // Per-frame-in-flight resources. The original code shared a single command
+    // buffer, fence and descriptor set across every frame, so the CPU had to
+    // wait for the GPU before presenting, and the GPU then sat idle through the
+    // whole CPU round-trip before the next decode could be submitted. With a
+    // small ring of slots the dependency becomes a semaphore: the GPU can start
+    // the next decode as soon as the previous conversion signals it.
+    //
+    // All frames share one set of YUV planes, so a decode must never start
+    // before the previous conversion has finished reading them. That is
+    // expressed by passing the previous slot's convert_done as the decoder's
+    // acquire semaphore (pyrowave_decoder_decode_gpu's first sync argument).
+    static constexpr std::uint32_t kMaxFrameDepth = 3;
+    struct frame_slot {
+        VkCommandBuffer command_buffer{VK_NULL_HANDLE};
+        VkCommandBuffer timestamp_cb{VK_NULL_HANDLE};
+        VkFence fence{VK_NULL_HANDLE};
+        VkSemaphore acquire{VK_NULL_HANDLE};
+        VkSemaphore decode_done{VK_NULL_HANDLE};
+        VkSemaphore convert_done{VK_NULL_HANDLE};
+        VkDescriptorSet descriptor_set{VK_NULL_HANDLE};
+        bool fence_pending{false};
+        // True while convert_done carries an unconsumed signal. Only then may
+        // the next frame's decode wait on it; otherwise it would deadlock.
+        bool convert_signalled{false};
+    };
+    std::array<frame_slot, kMaxFrameDepth> slots{};
+    std::uint32_t frame_depth{1};
+    std::uint32_t slot_index{0};
+
     VkCommandPool command_pool{VK_NULL_HANDLE};
-    VkCommandBuffer command_buffer{VK_NULL_HANDLE};
-    VkFence submit_fence{VK_NULL_HANDLE};
     VkFence drain_fence{VK_NULL_HANDLE};
+    // GPU-side measurement of the YUV -> RGBA conversion pass. Together with the
+    // CPU-side fence wait this separates "the GPU is busy inside convert" from
+    // "the GPU is still busy inside the PyroWave decode submission".
+    VkQueryPool timestamp_pool{VK_NULL_HANDLE};
+    float timestamp_period_ns{1.0F};
+    bool timestamps_available{false};
 
     VkShaderModule conversion_shader{VK_NULL_HANDLE};
     VkDescriptorSetLayout descriptor_layout{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout{VK_NULL_HANDLE};
     VkPipeline conversion_pipeline{VK_NULL_HANDLE};
     VkDescriptorPool descriptor_pool{VK_NULL_HANDLE};
-    VkDescriptorSet descriptor_set{VK_NULL_HANDLE};
     VkSampler sampler{VK_NULL_HANDLE};
     VkBuffer mapping_buffer{VK_NULL_HANDLE};
     VkDeviceMemory mapping_memory{VK_NULL_HANDLE};
@@ -304,10 +350,10 @@ struct PyrowaveVulkanDecoder::impl {
         return -1;
     }
 
-    bool consume_pending_decode_signal() {
+    bool consume_pending_decode_signal(frame_slot &slot) {
         if (!decode_signal_pending) return true;
         if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE ||
-            decode_complete_semaphore == VK_NULL_HANDLE || drain_fence == VK_NULL_HANDLE) {
+            slot.decode_done == VK_NULL_HANDLE || drain_fence == VK_NULL_HANDLE) {
             LOGW("PyroWave Vulkan could not drain decode completion semaphore: sync objects unavailable");
             return false;
         }
@@ -317,14 +363,17 @@ struct PyrowaveVulkanDecoder::impl {
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .pNext = nullptr,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &decode_complete_semaphore,
+            .pWaitSemaphores = &slot.decode_done,
             .pWaitDstStageMask = &wait_stage,
             .commandBufferCount = 0,
             .pCommandBuffers = nullptr,
             .signalSemaphoreCount = 0,
             .pSignalSemaphores = nullptr,
         };
+        PWV_TRACE("DRAIN: -> vkQueueSubmit wait-only (wait={dec=%p} cmdCount=0)",
+                  reinterpret_cast<const void *>(slot.decode_done));
         const auto submit_result = vkQueueSubmit(queue, 1, &submit, drain_fence);
+        PWV_TRACE("DRAIN: <- vkQueueSubmit wait-only res=%d", static_cast<int>(submit_result));
         if (submit_result != VK_SUCCESS) {
             LOGW("PyroWave Vulkan could not drain decode completion semaphore at queue submit (VkResult=%d)",
                  static_cast<int>(submit_result));
@@ -347,7 +396,7 @@ struct PyrowaveVulkanDecoder::impl {
     }
 
     int submit_failure_after_decode(const char *stage, int code = 0, std::size_t size = 0) {
-        if (!consume_pending_decode_signal()) {
+        if (!consume_pending_decode_signal(slots[slot_index])) {
             LOGW("PyroWave Vulkan decode completion remains pending after %s", stage);
         }
         return submit_failure(stage, code, size);
@@ -439,6 +488,8 @@ struct PyrowaveVulkanDecoder::impl {
                 if (vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, surface, &present) != VK_SUCCESS || !present) continue;
                 physical_device = candidate;
                 queue_family = i;
+                timestamp_period_ns = props.limits.timestampPeriod;
+                timestamps_available = props.limits.timestampComputeAndGraphics != 0;
                 break;
             }
             if (physical_device != VK_NULL_HANDLE) break;
@@ -515,6 +566,16 @@ struct PyrowaveVulkanDecoder::impl {
         }
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         queue_info = { queue, queue_family, 0 };
+        if (timestamps_available) {
+            // 0 = conversion start, 1 = conversion end, 2 = pre-decode stamp.
+            VkQueryPoolCreateInfo query_info{ .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                              .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 3 };
+            if (vkCreateQueryPool(device, &query_info, nullptr, &timestamp_pool) != VK_SUCCESS) {
+                timestamp_pool = VK_NULL_HANDLE;
+                timestamps_available = false;
+                LOGW("PyroWave: GPU timestamp pool unavailable; using wall-clock estimates only");
+            }
+        }
 
         pyrowave_device_create_info pyro_info{
             .GetInstanceProcAddr = vkGetInstanceProcAddr,
@@ -555,29 +616,65 @@ struct PyrowaveVulkanDecoder::impl {
         };
         const auto pool_result = vkCreateCommandPool(device, &pool_info, nullptr, &command_pool);
         if (pool_result != VK_SUCCESS) return log_vulkan_failure("vkCreateCommandPool", pool_result);
+
+        // How many frames may be in flight. 1 reproduces the original
+        // wait-for-the-GPU behaviour; larger values let the decoder start the
+        // next frame while the previous conversion is still running.
+        char prop_depth[PROP_VALUE_MAX] = {};
+        __system_property_get("debug.pyrowave.depth", prop_depth);
+        const long requested = prop_depth[0] != '\0' ? std::strtol(prop_depth, nullptr, 10) : 2;
+        frame_depth = (requested >= 1 && requested <= static_cast<long>(kMaxFrameDepth))
+                          ? static_cast<std::uint32_t>(requested)
+                          : 2;
+        slot_index = 0;
+
         VkCommandBufferAllocateInfo allocate_info{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .pNext = nullptr,
             .commandPool = command_pool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = 1,
+            .commandBufferCount = 2,
         };
-        const auto command_result = vkAllocateCommandBuffers(device, &allocate_info, &command_buffer);
-        if (command_result != VK_SUCCESS) return log_vulkan_failure("vkAllocateCommandBuffers", command_result);
         VkFenceCreateInfo fence_info{ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         VkSemaphoreCreateInfo semaphore_info{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-        const auto submit_fence_result = vkCreateFence(device, &fence_info, nullptr, &submit_fence);
-        if (submit_fence_result != VK_SUCCESS) return log_vulkan_failure("vkCreateFence(submit)", submit_fence_result);
-        const auto drain_fence_result = vkCreateFence(device, &fence_info, nullptr, &drain_fence);
-        if (drain_fence_result != VK_SUCCESS) return log_vulkan_failure("vkCreateFence(drain)", drain_fence_result);
-        const auto acquire_semaphore_result = vkCreateSemaphore(device, &semaphore_info, nullptr, &acquire_semaphore);
-        if (acquire_semaphore_result != VK_SUCCESS) {
-            return log_vulkan_failure("vkCreateSemaphore(acquire)", acquire_semaphore_result);
+        for (std::uint32_t i = 0; i < frame_depth; ++i) {
+            auto &slot = slots[i];
+            std::array<VkCommandBuffer, 2> buffers{};
+            const auto command_result = vkAllocateCommandBuffers(device, &allocate_info, buffers.data());
+            if (command_result != VK_SUCCESS) return log_vulkan_failure("vkAllocateCommandBuffers", command_result);
+            slot.command_buffer = buffers[0];
+            slot.timestamp_cb = buffers[1];
+            if (vkCreateFence(device, &fence_info, nullptr, &slot.fence) != VK_SUCCESS)
+                return log_vulkan_failure("vkCreateFence(submit)", VK_ERROR_INITIALIZATION_FAILED);
+            if (vkCreateSemaphore(device, &semaphore_info, nullptr, &slot.acquire) != VK_SUCCESS)
+                return log_vulkan_failure("vkCreateSemaphore(acquire)", VK_ERROR_INITIALIZATION_FAILED);
+            if (vkCreateSemaphore(device, &semaphore_info, nullptr, &slot.decode_done) != VK_SUCCESS)
+                return log_vulkan_failure("vkCreateSemaphore(decode-complete)", VK_ERROR_INITIALIZATION_FAILED);
+            if (vkCreateSemaphore(device, &semaphore_info, nullptr, &slot.convert_done) != VK_SUCCESS)
+                return log_vulkan_failure("vkCreateSemaphore(convert-complete)", VK_ERROR_INITIALIZATION_FAILED);
+            slot.fence_pending = false;
+            slot.convert_signalled = false;
         }
-        const auto decode_semaphore_result = vkCreateSemaphore(device, &semaphore_info, nullptr, &decode_complete_semaphore);
-        return decode_semaphore_result == VK_SUCCESS
-            ? true
-            : log_vulkan_failure("vkCreateSemaphore(decode-complete)", decode_semaphore_result);
+        if (vkCreateFence(device, &fence_info, nullptr, &drain_fence) != VK_SUCCESS)
+            return log_vulkan_failure("vkCreateFence(drain)", VK_ERROR_INITIALIZATION_FAILED);
+        LOGI("PyroWave frame pipeline: depth=%u", frame_depth);
+        return true;
+    }
+
+    // Records the one-shot timestamp command buffer used to bracket the
+    // decoder's GPU work from the outside (the library owns its own command
+    // buffers, so we cannot write timestamps inside them).
+    bool record_timestamp_buffers() {
+        if (timestamp_pool == VK_NULL_HANDLE) return true;
+        VkCommandBufferBeginInfo begin_info{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        for (std::uint32_t i = 0; i < frame_depth; ++i) {
+            auto &slot = slots[i];
+            if (vkBeginCommandBuffer(slot.timestamp_cb, &begin_info) != VK_SUCCESS) return false;
+            vkCmdResetQueryPool(slot.timestamp_cb, timestamp_pool, 2, 1);
+            vkCmdWriteTimestamp(slot.timestamp_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamp_pool, 2);
+            if (vkEndCommandBuffer(slot.timestamp_cb) != VK_SUCCESS) return false;
+        }
+        return true;
     }
 
     bool apply_hdr_metadata() {
@@ -738,6 +835,63 @@ struct PyrowaveVulkanDecoder::impl {
         }
         std::uint32_t image_count = std::max(2u, caps.minImageCount);
         if (caps.maxImageCount != 0) image_count = std::min(image_count, caps.maxImageCount);
+
+        // Presentation latency control. The original code hard-coded FIFO with a
+        // minimal image count: on a 120 Hz panel that queues the frame behind the
+        // already-pending one and blocks until an image is released, which shows
+        // up as a roughly constant ~15 ms "present" cost that barely changes with
+        // resolution. MAILBOX lets the newest frame replace the pending one, which
+        // is the standard low-latency choice for streaming.
+        //
+        // Selection is overridable at runtime (no rebuild needed) for A/B testing:
+        //   setprop debug.pyrowave.present mailbox | immediate | fifo | auto
+        //   setprop debug.pyrowave.images  3
+        // Kill and restart the app for it to take effect.
+        char prop_present[PROP_VALUE_MAX] = {};
+        __system_property_get("debug.pyrowave.present", prop_present);
+        char prop_images[PROP_VALUE_MAX] = {};
+        __system_property_get("debug.pyrowave.images", prop_images);
+
+        std::uint32_t present_mode_count = 0;
+        std::vector<VkPresentModeKHR> modes;
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, nullptr) == VK_SUCCESS &&
+            present_mode_count > 0) {
+            modes.resize(present_mode_count);
+            if (vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, modes.data()) != VK_SUCCESS)
+                modes.clear();
+        }
+        const auto have = [&modes](VkPresentModeKHR m) {
+            for (auto x : modes) if (x == m) return true;
+            return false;
+        };
+        const bool want_mailbox = std::strcmp(prop_present, "mailbox") == 0 ||
+                                  prop_present[0] == '\0' || std::strcmp(prop_present, "auto") == 0;
+        const bool want_immediate = std::strcmp(prop_present, "immediate") == 0;
+
+        VkPresentModeKHR selected_mode = VK_PRESENT_MODE_FIFO_KHR;
+        if (want_immediate && have(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+            selected_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        } else if (want_mailbox && have(VK_PRESENT_MODE_MAILBOX_KHR)) {
+            selected_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+        } else if (want_mailbox && have(VK_PRESENT_MODE_IMMEDIATE_KHR) && prop_present[0] != '\0') {
+            selected_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        if (selected_mode != VK_PRESENT_MODE_FIFO_KHR) {
+            // Queueing requires a spare image, otherwise it degenerates to FIFO.
+            image_count = std::max(image_count, 3u);
+            if (caps.maxImageCount != 0) image_count = std::min(image_count, caps.maxImageCount);
+        }
+        if (prop_images[0] != '\0') {
+            const long requested = std::strtol(prop_images, nullptr, 10);
+            if (requested >= 2) {
+                image_count = static_cast<std::uint32_t>(requested);
+                if (caps.maxImageCount != 0) image_count = std::min(image_count, caps.maxImageCount);
+                image_count = std::max(image_count, caps.minImageCount);
+            }
+        }
+        LOGI("PyroWave swapchain: extent=%ux%u presentMode=%u imageCount=%u min/max=%u/%u (requested='%s' images='%s')",
+             extent.width, extent.height, static_cast<unsigned>(selected_mode), image_count,
+             caps.minImageCount, caps.maxImageCount, prop_present, prop_images);
         VkSurfaceTransformFlagBitsKHR pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         if ((caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) == 0) {
             // The conversion shader writes upright frames and does not apply
@@ -772,7 +926,7 @@ struct PyrowaveVulkanDecoder::impl {
             .pQueueFamilyIndices = nullptr,
             .preTransform = pre_transform,
             .compositeAlpha = composite_alpha,
-            .presentMode = VK_PRESENT_MODE_FIFO_KHR,
+            .presentMode = selected_mode,
             .clipped = VK_TRUE,
             .oldSwapchain = VK_NULL_HANDLE,
         };
@@ -896,11 +1050,11 @@ struct PyrowaveVulkanDecoder::impl {
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
             .pInheritanceInfo = nullptr,
         };
-        const auto reset_command_result = vkResetCommandBuffer(command_buffer, 0);
+        const auto reset_command_result = vkResetCommandBuffer(slots[0].command_buffer, 0);
         if (reset_command_result != VK_SUCCESS) {
             return log_vulkan_failure("vkResetCommandBuffer(planes)", reset_command_result);
         }
-        const auto begin_result = vkBeginCommandBuffer(command_buffer, &begin_info);
+        const auto begin_result = vkBeginCommandBuffer(slots[0].command_buffer, &begin_info);
         if (begin_result != VK_SUCCESS) return log_vulkan_failure("vkBeginCommandBuffer(planes)", begin_result);
         const VkAccessFlags plane_write_access = fragment_path
             ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
@@ -923,18 +1077,18 @@ struct PyrowaveVulkanDecoder::impl {
                 .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
             };
         }
-        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        vkCmdPipelineBarrier(slots[0].command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              plane_write_stage, 0, 0, nullptr, 0, nullptr,
                              static_cast<std::uint32_t>(barriers.size()), barriers.data());
-        const auto end_result = vkEndCommandBuffer(command_buffer);
+        const auto end_result = vkEndCommandBuffer(slots[0].command_buffer);
         if (end_result != VK_SUCCESS) return log_vulkan_failure("vkEndCommandBuffer(planes)", end_result);
         VkSubmitInfo submit{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
-                             .pCommandBuffers = &command_buffer };
-        const auto queue_result = vkQueueSubmit(queue, 1, &submit, submit_fence);
+                             .pCommandBuffers = &slots[0].command_buffer };
+        const auto queue_result = vkQueueSubmit(queue, 1, &submit, slots[0].fence);
         if (queue_result != VK_SUCCESS) return log_vulkan_failure("vkQueueSubmit(planes)", queue_result);
-        const auto fence_result = vkWaitForFences(device, 1, &submit_fence, VK_TRUE, kGpuWaitTimeoutNs);
+        const auto fence_result = vkWaitForFences(device, 1, &slots[0].fence, VK_TRUE, kGpuWaitTimeoutNs);
         if (fence_result != VK_SUCCESS) return log_vulkan_failure("vkWaitForFences(planes)", fence_result);
-        const auto reset_result = vkResetFences(device, 1, &submit_fence);
+        const auto reset_result = vkResetFences(device, 1, &slots[0].fence);
         if (reset_result != VK_SUCCESS) return log_vulkan_failure("vkResetFences(planes)", reset_result);
         return true;
     }
@@ -1023,20 +1177,44 @@ struct PyrowaveVulkanDecoder::impl {
             .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                        .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = conversion_shader, .pName = "main" },
             .layout = pipeline_layout };
+        // REAL_PASS enables the 5-tap sharpen in the conversion shader. It costs
+        // four extra sampler reads per presented pixel, so make it switchable and
+        // keep it on by default to preserve the existing picture (the YCbCr
+        // sampler still does the 4:2:0 -> RGB chroma reconstruction either way).
+        //   setprop debug.pyrowave.sharpen 0   # off, 1 sample/px
+        {
+            char prop_sharpen[PROP_VALUE_MAX] = {};
+            __system_property_get("debug.pyrowave.sharpen", prop_sharpen);
+            const int real_pass = prop_sharpen[0] == '0' ? 0 : 1;
+            const VkSpecializationMapEntry entry{ 1, 0, sizeof(int) };
+            VkSpecializationInfo spec{ .mapEntryCount = 1, .pMapEntries = &entry,
+                                       .dataSize = sizeof(int), .pData = &real_pass };
+            pipeline_info.stage.pSpecializationInfo = &spec;
+            LOGI("PyroWave conversion pipeline: sharpen=%d", real_pass);
+        }
         const auto pipeline_result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &conversion_pipeline);
         if (pipeline_result != VK_SUCCESS) return log_vulkan_failure("vkCreateComputePipelines", pipeline_result);
-        VkDescriptorPoolSize sizes[3] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 } };
+        // Sized per in-flight frame: the counts are totals for the whole pool,
+        // not per set.
+        VkDescriptorPoolSize sizes[3] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * frame_depth },
+                                          { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 * frame_depth },
+                                          { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 * frame_depth } };
         VkDescriptorPoolCreateInfo pool_info{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                              .maxSets = 1, .poolSizeCount = hdr_mode != 0 ? 3U : 2U, .pPoolSizes = sizes };
+                                              .maxSets = frame_depth, .poolSizeCount = hdr_mode != 0 ? 3U : 2U, .pPoolSizes = sizes };
         const auto pool_result = vkCreateDescriptorPool(device, &pool_info, nullptr, &descriptor_pool);
         if (pool_result != VK_SUCCESS) return log_vulkan_failure("vkCreateDescriptorPool", pool_result);
+        // One descriptor set per in-flight frame: each set pins the swapchain
+        // image view it renders into, so it must not be rewritten while the GPU
+        // is still reading it for an earlier frame.
+        std::vector<VkDescriptorSetLayout> layouts(frame_depth, descriptor_layout);
+        std::vector<VkDescriptorSet> sets(frame_depth, VK_NULL_HANDLE);
         VkDescriptorSetAllocateInfo allocation{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                .descriptorPool = descriptor_pool, .descriptorSetCount = 1,
-                                                .pSetLayouts = &descriptor_layout };
-        const auto descriptor_result = vkAllocateDescriptorSets(device, &allocation, &descriptor_set);
+                                                .descriptorPool = descriptor_pool,
+                                                .descriptorSetCount = frame_depth,
+                                                .pSetLayouts = layouts.data() };
+        const auto descriptor_result = vkAllocateDescriptorSets(device, &allocation, sets.data());
         if (descriptor_result != VK_SUCCESS) return log_vulkan_failure("vkAllocateDescriptorSets", descriptor_result);
+        for (std::uint32_t i = 0; i < frame_depth; ++i) slots[i].descriptor_set = sets[i];
         VkSamplerCreateInfo sampler_info{ .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
             .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
             .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
@@ -1105,6 +1283,11 @@ struct PyrowaveVulkanDecoder::impl {
             release_locked();
             return false;
         }
+        if (!record_timestamp_buffers()) {
+            LOGW("PyroWave Vulkan decoder initialization failed: timestamp buffers");
+            release_locked();
+            return false;
+        }
         return true;
     }
 
@@ -1114,17 +1297,38 @@ struct PyrowaveVulkanDecoder::impl {
         // Only teardown/reinitialization may make this handle reusable.
         if (submit_failed) return -1;
         const auto frame_number = ++submitted_frames;
+        PWV_TRACE("f%llu: >>> submit_locked enter (len=%zu)", static_cast<unsigned long long>(frame_number), length);
         const auto decode_start = std::chrono::steady_clock::now();
         if (!ready_for_submit()) return submit_failure("decoder-not-ready");
         if (data == nullptr || length == 0) return submit_failure("invalid-packet");
+
+        // Claim the next slot in the ring. With depth > 1 the fence we wait on
+        // belongs to a frame submitted `depth` frames ago, so the GPU stays fed
+        // while this CPU-side code runs.
+        auto &slot = slots[slot_index];
+        const auto slot_wait_start = std::chrono::steady_clock::now();
+        if (slot.fence_pending) {
+            if (vkWaitForFences(device, 1, &slot.fence, VK_TRUE, kGpuWaitTimeoutNs) != VK_SUCCESS)
+                return submit_failure("wait-slot-fence");
+            if (vkResetFences(device, 1, &slot.fence) != VK_SUCCESS) return submit_failure("reset-slot-fence");
+            slot.fence_pending = false;
+            // Everything this slot owned has completed, so any convert_done
+            // signal it carried has been consumed by the following frame.
+            slot.convert_signalled = false;
+        }
+        const std::uint64_t slot_wait_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - slot_wait_start).count());
+        PWV_TRACE("f%llu: -> api.push", static_cast<unsigned long long>(frame_number));
         if (api.push(decoder, data, length) != PYROWAVE_SUCCESS) {
             return submit_failure("push-packet", static_cast<int>(PYROWAVE_ERROR_GENERIC), length);
         }
+        PWV_TRACE("f%llu: -> api.ready", static_cast<unsigned long long>(frame_number));
         if (!api.ready(decoder, false)) {
             api.clear_decoder(decoder);
             return PYROWAVE_SUBMIT_FRAME_DROPPED;
         }
         pyrowave_color_metadata metadata {};
+        PWV_TRACE("f%llu: -> api.get_color_metadata", static_cast<unsigned long long>(frame_number));
         if (!api.get_color_metadata(decoder, &metadata)) return submit_failure("color-metadata", 0, length);
         const bool expected_hdr = hdr_mode != 0;
         const auto expected_transfer = hdr_mode == 2 ? PYROWAVE_TRANSFER_HLG : PYROWAVE_TRANSFER_PQ;
@@ -1148,61 +1352,96 @@ struct PyrowaveVulkanDecoder::impl {
         pyrowave_gpu_sync_operation release_sync{
             .images = nullptr,
             .num_images = 0,
-            .sync = { decode_complete_semaphore, 0 },
+            .sync = { slot.decode_done, 0 },
         };
-        const auto decode_result = api.decode_gpu(decoder, nullptr, &release_sync, &buffers);
+        // Every frame decodes into the same YUV planes, so the decoder must not
+        // start writing them until the previous frame's conversion has finished
+        // reading them. With depth == 1 the slot fence wait above already
+        // guarantees that and no semaphore is needed.
+        pyrowave_gpu_sync_operation acquire_sync{
+            .images = nullptr,
+            .num_images = 0,
+            .sync = { VK_NULL_HANDLE, 0 },
+        };
+        if (frame_depth > 1) {
+            auto &previous = slots[(slot_index + frame_depth - 1) % frame_depth];
+            if (previous.convert_signalled) {
+                acquire_sync.sync = { previous.convert_done, 0 };
+                previous.convert_signalled = false;
+            }
+        }
+        if (timestamp_pool != VK_NULL_HANDLE) {
+            VkSubmitInfo stamp_submit{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                                       .pCommandBuffers = &slot.timestamp_cb };
+            vkQueueSubmit(queue, 1, &stamp_submit, VK_NULL_HANDLE);
+        }
+        PWV_TRACE("f%llu: -> api.decode_gpu (release_sem=%p acquire_sem=%p)", static_cast<unsigned long long>(frame_number),
+                  reinterpret_cast<const void *>(slot.decode_done),
+                  reinterpret_cast<const void *>(acquire_sync.sync.semaphore));
+        const auto decode_result = api.decode_gpu(decoder, &acquire_sync, &release_sync, &buffers);
         if (decode_result != PYROWAVE_SUCCESS) {
             return submit_failure("decode-gpu", static_cast<int>(decode_result), length);
         }
+        PWV_TRACE("f%llu: <- api.decode_gpu OK", static_cast<unsigned long long>(frame_number));
         decode_signal_pending = true;
         // The GPU completion is handed to the conversion submission through
-        // decode_complete_semaphore. Do not wait here: decode_end is the host
+        // slot.decode_done. Do not wait here: decode_end is the host
         // submission boundary, while the following interval includes the
         // semaphore wait, YUV conversion, and presentation submission.
         const auto decode_end = std::chrono::steady_clock::now();
 
         const auto present_start = decode_end;
+        const auto t0 = present_start;
         std::uint32_t image_index = 0;
-        VkResult acquire = vkAcquireNextImageKHR(device, swapchain, kGpuWaitTimeoutNs, acquire_semaphore, VK_NULL_HANDLE, &image_index);
+        PWV_TRACE("f%llu: -> vkAcquireNextImageKHR (acquire_sem=%p)", static_cast<unsigned long long>(frame_number),
+                  reinterpret_cast<const void *>(slot.acquire));
+        VkResult acquire = vkAcquireNextImageKHR(device, swapchain, kGpuWaitTimeoutNs, slot.acquire, VK_NULL_HANDLE, &image_index);
+        PWV_TRACE("f%llu: <- vkAcquireNextImageKHR res=%d idx=%u", static_cast<unsigned long long>(frame_number),
+                  static_cast<int>(acquire), image_index);
         if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
             return submit_failure_after_decode("acquire-image", acquire, length);
         }
         if (image_index >= swapchain_images.size()) {
             return submit_failure_after_decode("acquire-image-index", 0, length);
         }
+        const auto t1 = std::chrono::steady_clock::now();
 
         VkDescriptorImageInfo source_infos[3]{};
         for (std::size_t i = 0; i < 3; ++i) source_infos[i] = { sampler, planes[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkDescriptorImageInfo destination{ VK_NULL_HANDLE, swapchain_views[image_index], VK_IMAGE_LAYOUT_GENERAL };
         VkWriteDescriptorSet writes[5]{};
         for (std::uint32_t i = 0; i < 3; ++i) {
-            writes[i] = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = descriptor_set,
+            writes[i] = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = slot.descriptor_set,
                           .dstBinding = i, .descriptorCount = 1,
                           .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &source_infos[i] };
         }
-        writes[3] = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = descriptor_set,
+        writes[3] = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = slot.descriptor_set,
                       .dstBinding = 3, .descriptorCount = 1,
                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &destination };
         VkDescriptorBufferInfo mapping_info{mapping_buffer, 0, sizeof(moonlight::pyrowave::dynamic_hdr_lut)};
-        writes[4] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = descriptor_set,
+        writes[4] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = slot.descriptor_set,
             .dstBinding = 4, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .pBufferInfo = &mapping_info};
         vkUpdateDescriptorSets(device, hdr_mode != 0 ? 5U : 4U, writes, 0, nullptr);
 
         VkCommandBufferBeginInfo begin_info{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                              .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-        const auto reset_command_result = vkResetCommandBuffer(command_buffer, 0);
+        const auto reset_command_result = vkResetCommandBuffer(slot.command_buffer, 0);
         if (reset_command_result != VK_SUCCESS) {
             return submit_failure_after_decode("reset-command-buffer", reset_command_result, length);
         }
-        const auto begin_result = vkBeginCommandBuffer(command_buffer, &begin_info);
+        const auto begin_result = vkBeginCommandBuffer(slot.command_buffer, &begin_info);
         if (begin_result != VK_SUCCESS) {
             return submit_failure_after_decode("begin-command-buffer", begin_result, length);
+        }
+        if (timestamp_pool != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(slot.command_buffer, timestamp_pool, 0, 2);
+            vkCmdWriteTimestamp(slot.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamp_pool, 0);
         }
         if (dynamic_hdr_format != DYNAMIC_HDR_FORMAT_NONE) {
             VkMemoryBarrier metadata_visibility{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
-            vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vkCmdPipelineBarrier(slot.command_buffer, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &metadata_visibility, 0, nullptr, 0, nullptr);
         }
         std::array<VkImageMemoryBarrier, 4> barriers{};
@@ -1224,11 +1463,11 @@ struct PyrowaveVulkanDecoder::impl {
             .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = swapchain_images[image_index],
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-        vkCmdPipelineBarrier(command_buffer, plane_write_stage,
+        vkCmdPipelineBarrier(slot.command_buffer, plane_write_stage,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
                              static_cast<std::uint32_t>(barriers.size()), barriers.data());
-        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, conversion_pipeline);
-        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &descriptor_set, 0, nullptr);
+        vkCmdBindPipeline(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, conversion_pipeline);
+        vkCmdBindDescriptorSets(slot.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &slot.descriptor_set, 0, nullptr);
         const shader_constants constants{
             .scale_x = 1.0F,
             .scale_y = 1.0F,
@@ -1239,14 +1478,14 @@ struct PyrowaveVulkanDecoder::impl {
             .target_peak_nits = target_peak_nits,
             .padding = 0.0F,
         };
-        vkCmdPushConstants(command_buffer, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
-        vkCmdDispatch(command_buffer, (swapchain_extent.width + 7) / 8, (swapchain_extent.height + 7) / 8, 1);
+        vkCmdPushConstants(slot.command_buffer, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+        vkCmdDispatch(slot.command_buffer, (swapchain_extent.width + 7) / 8, (swapchain_extent.height + 7) / 8, 1);
         VkImageMemoryBarrier output_barrier{ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = 0,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = swapchain_images[image_index], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vkCmdPipelineBarrier(slot.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &output_barrier);
         for (std::size_t i = 0; i < 3; ++i) {
             barriers[i].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1254,42 +1493,122 @@ struct PyrowaveVulkanDecoder::impl {
             barriers[i].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
-        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vkCmdPipelineBarrier(slot.command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              plane_write_stage, 0, 0, nullptr, 0, nullptr, 3, barriers.data());
-        const auto end_result = vkEndCommandBuffer(command_buffer);
+        if (timestamp_pool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp(slot.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool, 1);
+        }
+        const auto end_result = vkEndCommandBuffer(slot.command_buffer);
         if (end_result != VK_SUCCESS) {
             return submit_failure_after_decode("end-command-buffer", end_result, length);
         }
-        std::array<VkSemaphore, 2> wait_semaphores{ decode_complete_semaphore, acquire_semaphore };
+        const auto t2 = std::chrono::steady_clock::now();
+        std::array<VkSemaphore, 2> wait_semaphores{ slot.decode_done, slot.acquire };
         std::array<VkPipelineStageFlags, 2> wait_stages{
             plane_write_stage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             plane_write_stage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         };
+        // Signal convert_done so the next frame's decode knows the planes are
+        // free again, and fence this slot so its command buffer can be recycled
+        // `depth` frames later.
         VkSubmitInfo submit{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = static_cast<std::uint32_t>(wait_semaphores.size()),
             .pWaitSemaphores = wait_semaphores.data(), .pWaitDstStageMask = wait_stages.data(),
-            .commandBufferCount = 1, .pCommandBuffers = &command_buffer };
-        const auto queue_result = vkQueueSubmit(queue, 1, &submit, submit_fence);
+            .commandBufferCount = 1, .pCommandBuffers = &slot.command_buffer,
+            .signalSemaphoreCount = 1, .pSignalSemaphores = &slot.convert_done };
+        PWV_TRACE("f%llu: -> vkQueueSubmit conv (queue=%p waits={dec=%p,acq=%p} cmdCount=%u fence=%p)",
+                  static_cast<unsigned long long>(frame_number),
+                  reinterpret_cast<const void *>(queue),
+                  reinterpret_cast<const void *>(slot.decode_done),
+                  reinterpret_cast<const void *>(slot.acquire),
+                  submit.commandBufferCount,
+                  reinterpret_cast<const void *>(slot.fence));
+        const auto queue_result = vkQueueSubmit(queue, 1, &submit, slot.fence);
         if (queue_result != VK_SUCCESS) {
             return submit_failure_after_decode("queue-submit", queue_result, length);
         }
+        slot.fence_pending = true;
+        slot.convert_signalled = true;
+        // Advance the ring only after the submission succeeded, so a failed
+        // frame does not leave a hole in the dependency chain.
+        slot_index = (slot_index + 1) % frame_depth;
+        const auto t3 = std::chrono::steady_clock::now();
+        PWV_TRACE("f%llu: <- vkQueueSubmit conv OK (fence=%p)", static_cast<unsigned long long>(frame_number),
+                  reinterpret_cast<const void *>(slot.fence));
         // The conversion submission now owns the wait on the decode semaphore.
         decode_signal_pending = false;
-        const auto fence_result = vkWaitForFences(device, 1, &submit_fence, VK_TRUE, kGpuWaitTimeoutNs);
-        if (fence_result != VK_SUCCESS) return submit_failure("wait-submit-fence", fence_result, length);
-        const auto reset_fence_result = vkResetFences(device, 1, &submit_fence);
-        if (reset_fence_result != VK_SUCCESS) {
-            return submit_failure("reset-submit-fence", reset_fence_result, length);
-        }
+        // Deliberately no vkWaitForFences here: presentation is already ordered
+        // after the conversion on the same queue, and the ring keeps the CPU
+        // from getting more than `depth` frames ahead of the GPU.
+        const auto t4 = std::chrono::steady_clock::now();
+
         if (dynamic_hdr_format != DYNAMIC_HDR_FORMAT_NONE && !apply_hdr_metadata()) {
             return submit_failure("dynamic-hdr-output-metadata", 0, metadata_length);
         }
         VkPresentInfoKHR present{ .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .swapchainCount = 1,
                                   .pSwapchains = &swapchain, .pImageIndices = &image_index };
+        PWV_TRACE("f%llu: -> vkQueuePresentKHR (idx=%u)", static_cast<unsigned long long>(frame_number), image_index);
         const VkResult result = vkQueuePresentKHR(queue, &present);
+        const auto t5 = std::chrono::steady_clock::now();
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
             return submit_failure("present", result, length);
         }
+        // Latency breakdown. Averaged over 60 frames and emitted once per window
+        // so the per-call cost stays negligible.
+        //   acquire  = waiting for a free swapchain image
+        //   record   = descriptor update + command buffer recording
+        //   submit   = vkQueueSubmit
+        //   present  = vkQueuePresentKHR hand-off to the compositor
+        //   cpu      = whole submit_locked wall time (the frame period when
+        //              the decoder is fed as fast as packets arrive)
+        //   slotWait = time this frame blocked waiting to recycle a ring slot,
+        //              i.e. how far the CPU had run ahead of the GPU
+        //   decodeGPU / convertGPU = pure GPU execution, from timestamps
+        {
+            static std::uint64_t perf_frames = 0;
+            static double perf_acquire = 0, perf_record = 0, perf_submit = 0, perf_present = 0;
+            static double perf_cpu = 0, perf_slot = 0;
+            static double perf_convert_gpu = 0, perf_decode_gpu = 0;
+            double convert_gpu_ms = 0.0, decode_gpu_ms = 0.0;
+            if (timestamp_pool != VK_NULL_HANDLE) {
+                std::uint64_t stamps[3]{};
+                if (vkGetQueryPoolResults(device, timestamp_pool, 0, 3, sizeof(stamps), stamps,
+                                          sizeof(stamps[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS &&
+                    stamps[1] > stamps[0]) {
+                    convert_gpu_ms = static_cast<double>(stamps[1] - stamps[0]) * static_cast<double>(timestamp_period_ns) / 1.0e6;
+                    // stamps[2] is written just before the decoder is invoked and
+                    // stamps[0] is the first thing the conversion command buffer
+                    // executes, so the gap is the decoder's GPU duration.
+                    if (stamps[0] > stamps[2])
+                        decode_gpu_ms = static_cast<double>(stamps[0] - stamps[2]) * static_cast<double>(timestamp_period_ns) / 1.0e6;
+                }
+            }
+            const auto us = [](auto a, auto b) {
+                return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+            };
+            perf_acquire += us(t0, t1);
+            perf_record += us(t1, t2);
+            perf_submit += us(t2, t3);
+            perf_present += us(t4, t5);
+            perf_cpu += us(decode_start, t5);
+            perf_slot += static_cast<double>(slot_wait_us);
+            perf_convert_gpu += convert_gpu_ms;
+            perf_decode_gpu += decode_gpu_ms;
+            ++perf_frames;
+            if (perf_frames >= 60) {
+                const auto n = static_cast<double>(perf_frames);
+                LOGI("PWVPERF frame ms: cpu=%.2f slotWait=%.2f acquire=%.2f record=%.2f submit=%.2f present=%.2f | GPU decode=%.2f convert=%.2f",
+                     perf_cpu / n / 1000.0, perf_slot / n / 1000.0,
+                     perf_acquire / n / 1000.0, perf_record / n / 1000.0,
+                     perf_submit / n / 1000.0, perf_present / n / 1000.0,
+                     perf_decode_gpu / n, perf_convert_gpu / n);
+                perf_frames = 0;
+                perf_acquire = perf_record = perf_submit = perf_present = 0;
+                perf_cpu = perf_slot = perf_convert_gpu = perf_decode_gpu = 0;
+            }
+        }
+
+        PWV_TRACE("f%llu: <<< frame done OK (res=%d)", static_cast<unsigned long long>(frame_number), static_cast<int>(result));
         if (dynamic_hdr_format != DYNAMIC_HDR_FORMAT_NONE && !dynamic_hdr_logged) {
             LOGI("PyroWave dynamic HDR applied: format=%d presentation=application-mapped output=%s target_peak=%.1f",
                  dynamic_hdr_format, hdr_mode == 2 ? "HLG" : "PQ", target_peak_nits);
@@ -1337,12 +1656,27 @@ struct PyrowaveVulkanDecoder::impl {
         dynamic_scene = {};
         dynamic_frame_applied = false;
         dynamic_hdr_logged = false;
-        destroy_handle(device, acquire_semaphore, vkDestroySemaphore);
-        destroy_handle(device, decode_complete_semaphore, vkDestroySemaphore);
-        destroy_handle(device, submit_fence, vkDestroyFence);
         destroy_handle(device, drain_fence, vkDestroyFence);
-        if (device != VK_NULL_HANDLE && command_buffer != VK_NULL_HANDLE && command_pool != VK_NULL_HANDLE)
-            vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
+        destroy_handle(device, timestamp_pool, vkDestroyQueryPool);
+        timestamp_pool = VK_NULL_HANDLE;
+        for (std::uint32_t i = 0; i < kMaxFrameDepth; ++i) {
+            auto &slot = slots[i];
+            destroy_handle(device, slot.acquire, vkDestroySemaphore);
+            destroy_handle(device, slot.decode_done, vkDestroySemaphore);
+            destroy_handle(device, slot.convert_done, vkDestroySemaphore);
+            destroy_handle(device, slot.fence, vkDestroyFence);
+            slot.fence_pending = false;
+            slot.convert_signalled = false;
+            slot.descriptor_set = VK_NULL_HANDLE;
+            if (device != VK_NULL_HANDLE && command_pool != VK_NULL_HANDLE &&
+                (slot.command_buffer != VK_NULL_HANDLE || slot.timestamp_cb != VK_NULL_HANDLE)) {
+                std::array<VkCommandBuffer, 2> buffers{ slot.command_buffer, slot.timestamp_cb };
+                vkFreeCommandBuffers(device, command_pool, 2, buffers.data());
+            }
+            slot.command_buffer = VK_NULL_HANDLE;
+            slot.timestamp_cb = VK_NULL_HANDLE;
+        }
+        slot_index = 0;
         destroy_handle(device, command_pool, vkDestroyCommandPool);
         for (auto &view : swapchain_views) destroy_handle(device, view, vkDestroyImageView);
         swapchain_views.clear();
