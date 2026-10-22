@@ -1,7 +1,9 @@
 @file:Suppress("DEPRECATION")
 package com.limelight
 
+import com.limelight.ui.PenWheelOverlay
 import com.limelight.ui.ThemedComponentActivity
+import com.limelight.binding.input.PenWheelAction
 import com.limelight.binding.input.driver.UsbWaveformBackends
 
 import android.hardware.usb.UsbManager
@@ -67,7 +69,9 @@ import com.limelight.ui.GameMenuAxisSourceLifecycle
 import com.limelight.ui.StreamView
 import com.limelight.ui.StartHoldWheelOverlay
 import com.limelight.utils.Dialog
+import com.limelight.utils.OledBurnInGuard
 import com.limelight.utils.PanZoomHandler
+import com.limelight.utils.PenButtonController
 import com.limelight.utils.RemoteImeController
 import com.limelight.utils.FullscreenProgressOverlay
 import com.limelight.utils.HdrCapabilityHelper
@@ -154,6 +158,8 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     lateinit var touchInputHandler: TouchInputHandler
     var virtualController: VirtualController? = null
     lateinit var panZoomHandler: PanZoomHandler
+    /** Null when the user has disabled both mitigations. */
+    private var oledBurnInGuard: OledBurnInGuard? = null
     private lateinit var remoteImeController: RemoteImeController
     @Volatile private var destroying = false
     private var audioVibrationService: AudioVibrationService? = null
@@ -228,6 +234,16 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     private var startHoldWheelView: ComposeView? = null
     private val startHoldWheelVisible = mutableStateOf(false)
     private val startHoldWheelSelection = mutableStateOf(StartWheelAction.CONTINUE)
+
+    // S Pen barrel button -> tap toggles a tool, hold opens the radial wheel.
+    private var penButtonController: PenButtonController? = null
+    private var penWheelView: ComposeView? = null
+    private val penWheelVisible = mutableStateOf(false)
+    private val penWheelCenterX = mutableStateOf(0f)
+    private val penWheelCenterY = mutableStateOf(0f)
+    private val penWheelRadius = mutableStateOf(220f)
+    private val penWheelSelection = mutableStateOf(-1)
+    private val penWheelSlots = mutableStateOf(PenWheelAction.defaultSlots)
     private val pipInteractiveOverlayState = PipInteractiveOverlayState()
     /** Preserve virtual-controller visibility across OEM-specific stop/PiP callback ordering. */
     private var virtualControllerVisibleBeforeStop: Boolean? = null
@@ -420,6 +436,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         streamView.setOnKeyListener(this)
         streamView.setInputCallbacks(this)
         installStartHoldWheelOverlay(streamView.parent as FrameLayout)
+        installPenWheelOverlay(streamView.parent as FrameLayout)
 
         if (prefConfig.screenDs5Touchpad) {
             addDs5TouchpadFeedbackView()
@@ -427,6 +444,16 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
 
         val cursorOverlayView = findViewById<CursorView>(R.id.cursorOverlay)
         panZoomHandler = PanZoomHandler(this, this, streamView, cursorOverlayView, prefConfig)
+        oledBurnInGuard = OledBurnInGuard(
+            panZoomHandler,
+            streamView.parent as FrameLayout,
+            prefConfig.oledPixelShiftEnabled,
+            prefConfig.oledPixelShiftAmplitude,
+            prefConfig.oledPixelShiftIntervalSec * 1000L,
+            OLED_IDLE_BEFORE_SHIFT_MS,
+            prefConfig.oledIdleDimMinutes
+        )
+        oledBurnInGuard?.start()
         remoteImeController = RemoteImeController(this, streamView, panZoomHandler,
             autoShowEnabled = prefConfig.remoteImeAutoShow)
 
@@ -523,6 +550,8 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         keyboardInputHandler = KeyboardInputHandler(this)
         keyboardInputHandler.keyboardTranslator = KeyboardTranslator()
 
+        setupPenButtonController()
+
         audioVibrationService = AudioVibrationService(this)
         audioVibrationService?.controllerHandler = controllerHandler
         bindAudioHapticsTouchArbitration()
@@ -578,6 +607,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         streamView.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
             if (left != oldLeft || top != oldTop || right != oldRight || bottom != oldBottom) {
                 cursorServiceManager.syncCursorWithStream()
+                penButtonController?.setViewport(right - left, bottom - top)
             }
         }
         streamView.post { cursorServiceManager.syncCursorWithStream() }
@@ -1363,6 +1393,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
 
     override fun onResume() {
         super.onResume()
+        oledBurnInGuard?.start()
         if (::floatBallHandler.isInitialized &&
             (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || !isInPictureInPictureMode) &&
             !pipInteractiveOverlayState.isActive() &&
@@ -1734,6 +1765,10 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
 
     override fun onDestroy() {
         destroying = true
+        oledBurnInGuard?.stop()
+        oledBurnInGuard = null
+        penButtonController?.cancel()
+        penButtonController = null
         MoonBridge.detachConnectionListener(this)
         if (::streamView.isInitialized) {
             streamView.setInputCallbacks(null)
@@ -1901,6 +1936,10 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     override fun onStop() {
         super.onStop()
         usbForwarding?.stopForeground()
+        // Backgrounded: there is nothing to protect on a screen nobody sees,
+        // and a scheduled shift would come back to a rotated or resized layout.
+        oledBurnInGuard?.stop()
+        penButtonController?.cancel()
 
         if ((isExtremeResumeEnabled || isChangingResolution) && !isFinishing) {
             LimeLog.info("Extreme Resume: onStop intercepted.")
@@ -2071,6 +2110,8 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        oledBurnInGuard?.notifyInput()
+        if (penButtonController?.onMotion(event) == true) return true
         if (usbForwarding?.consumes(event.device) == true) return true
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             controllerManager?.elementController?.cancelDirectConfigSwitch()
@@ -2083,6 +2124,25 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
                 controllerManager?.elementController?.finishStreamTouch(event.actionMasked)
             }
         }
+    }
+
+    /**
+     * Hover is where the S Pen button lives: while the pen floats above the
+     * glass the barrel button arrives as a bit inside these events, and no key
+     * event is ever generated. Hooking the dispatcher (rather than a view
+     * listener) means it still works when the wheel layer is on top.
+     */
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        oledBurnInGuard?.notifyInput()
+        if (penButtonController?.onMotion(event) == true) return true
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    // Key events never reach onKeyDown when a view consumes them, which is the
+    // normal case for the stream view, so hook the dispatcher instead.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        oledBurnInGuard?.notifyInput()
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -2187,11 +2247,13 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        oledBurnInGuard?.notifyInput()
         if (usbForwarding?.consumes(event.device) == true) return true
         return touchInputHandler.handleMotionEvent(getMotionEventTargetView(), event) || super.onGenericMotionEvent(event)
     }
 
     override fun onGenericMotion(view: View, event: MotionEvent): Boolean {
+        oledBurnInGuard?.notifyInput()
         if (usbForwarding?.consumes(event.device) == true) return true
         return touchInputHandler.handleMotionEvent(view, event)
     }
@@ -3246,6 +3308,80 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         )
     }
 
+    private fun installPenWheelOverlay(parent: FrameLayout) {
+        penWheelView = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+            isFocusable = false
+            isFocusableInTouchMode = false
+            isClickable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            // GONE until it is first shown, then left VISIBLE: the wheel animates
+            // out, so hiding the host view immediately would cut its own exit
+            // short. A visible-but-empty non-clickable layer costs nothing and
+            // does not swallow pen input below it.
+            visibility = View.GONE
+            setOnTouchListener { _, _ -> false }
+            setContent {
+                PenWheelOverlay(
+                    visible = penWheelVisible.value,
+                    centerX = penWheelCenterX.value,
+                    centerY = penWheelCenterY.value,
+                    radiusPx = penWheelRadius.value,
+                    slots = penWheelSlots.value,
+                    selection = penWheelSelection.value,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+        }
+        parent.addView(
+            penWheelView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+    }
+
+    private fun setupPenButtonController() {
+        if (!prefConfig.penButtonEnabled) return
+        val slots = prefConfig.penWheelSlots
+        penWheelSlots.value = slots
+
+        penButtonController = PenButtonController(
+            enabled = true,
+            longPressMs = prefConfig.penButtonLongPressMs,
+            slots = slots,
+            clickToolA = prefConfig.penButtonClickToolA,
+            clickToolB = prefConfig.penButtonClickToolB,
+            listener = object : PenButtonController.Listener {
+                override fun showWheel(centerX: Float, centerY: Float, radius: Float) {
+                    runOnUiThread {
+                        penWheelCenterX.value = centerX
+                        penWheelCenterY.value = centerY
+                        penWheelRadius.value = radius
+                        penWheelSelection.value = -1
+                        penWheelVisible.value = true
+                        penWheelView?.visibility = View.VISIBLE
+                        penWheelView?.bringToFront()
+                    }
+                }
+
+                override fun updateSelection(index: Int) {
+                    runOnUiThread { penWheelSelection.value = index }
+                }
+
+                override fun hideWheel() {
+                    runOnUiThread { penWheelVisible.value = false }
+                }
+
+                override fun fire(action: PenWheelAction) {
+                    runOnUiThread { keyboardInputHandler?.sendShortcut(action) }
+                }
+            }
+        )
+        penButtonController?.setViewport(streamView.width, streamView.height)
+    }
+
     override fun showStartHoldWheel() {
         runOnUiThread {
             startHoldWheelVisible.value = true
@@ -3427,6 +3563,9 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     companion object {
         val REFERENCE_HORIZ_RES = 1280
         val REFERENCE_VERT_RES = 720
+
+        /** Input must have stopped for this long before the image may be shifted. */
+        const val OLED_IDLE_BEFORE_SHIFT_MS = 3000L
 
         val EXTRA_HOST = "Host"
         val EXTRA_PORT = "Port"

@@ -642,4 +642,70 @@
     <string-array name="fec_mode_values">
         <item>host</item><item>automatic</item><item>fixed</item>
     </string-array>
+
+    <string-array name="oled_pixel_shift_amplitude_names">
+        <item>@string/oled_shift_amplitude_2</item>
+        <item>@string/oled_shift_amplitude_3</item>
+        <item>@string/oled_shift_amplitude_4</item>
+        <item>@string/oled_shift_amplitude_6</item>
+    </string-array>
+    <string-array name="oled_pixel_shift_amplitude_values" translatable="false">
+        <item>2</item><item>3</item><item>4</item><item>6</item>
+    </string-array>
+
+    <string-array name="oled_pixel_shift_interval_names">
+        <item>@string/oled_shift_interval_15</item>
+        <item>@string/oled_shift_interval_30</item>
+        <item>@string/oled_shift_interval_60</item>
+        <item>@string/oled_shift_interval_120</item>
+    </string-array>
+    <string-array name="oled_pixel_shift_interval_values" translatable="false">
+        <item>15</item><item>30</item><item>60</item><item>120</item>
+    </string-array>
+
+    <string-array name="oled_idle_dim_names">
+        <item>@string/oled_idle_dim_off</item>
+        <item>@string/oled_idle_dim_3</item>
+        <item>@string/oled_idle_dim_5</item>
+        <item>@string/oled_idle_dim_10</item>
+        <item>@string/oled_idle_dim_30</item>
+    </string-array>
+    <string-array name="oled_idle_dim_values" translatable="false">
+        <item>0</item><item>3</item><item>5</item><item>10</item><item>30</item>
+    </string-array>
+
+    <string-array name="pen_wheel_action_names">
+        <item>@string/pen_wheel_action_none</item>
+        <item>@string/pen_wheel_action_brush</item>
+        <item>@string/pen_wheel_action_eraser</item>
+        <item>@string/pen_wheel_action_pencil</item>
+        <item>@string/pen_wheel_action_eyedropper</item>
+        <item>@string/pen_wheel_action_hand</item>
+        <item>@string/pen_wheel_action_lasso</item>
+        <item>@string/pen_wheel_action_fill</item>
+        <item>@string/pen_wheel_action_brush_bigger</item>
+        <item>@string/pen_wheel_action_brush_smaller</item>
+        <item>@string/pen_wheel_action_undo</item>
+        <item>@string/pen_wheel_action_redo</item>
+        <item>@string/pen_wheel_action_zoom_fit</item>
+        <item>@string/pen_wheel_action_save</item>
+        <item>@string/pen_wheel_action_new_layer</item>
+    </string-array>
+    <!-- Must stay in sync with PenWheelAction.prefValues. -->
+    <string-array name="pen_wheel_action_values" translatable="false">
+        <item>none</item><item>brush</item><item>eraser</item><item>pencil</item>
+        <item>eyedropper</item><item>hand</item><item>lasso</item><item>fill</item>
+        <item>brush_bigger</item><item>brush_smaller</item><item>undo</item><item>redo</item>
+        <item>zoom_fit</item><item>save</item><item>new_layer</item>
+    </string-array>
+
+    <string-array name="pen_button_hold_names">
+        <item>@string/pen_button_hold_200</item>
+        <item>@string/pen_button_hold_280</item>
+        <item>@string/pen_button_hold_400</item>
+        <item>@string/pen_button_hold_600</item>
+    </string-array>
+    <string-array name="pen_button_hold_values" translatable="false">
+        <item>200</item><item>280</item><item>400</item><item>600</item>
+    </string-array>
 </resources>

@@ -14,6 +14,7 @@ import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.preference.PreferenceManager
+import com.limelight.binding.input.PenWheelAction
 import com.limelight.binding.input.haptics.GameRumbleMode
 import com.limelight.binding.video.DecoderInputBufferMode
 import com.limelight.nvstream.jni.MoonBridge
@@ -119,6 +120,29 @@ class PreferenceConfiguration {
     var deadzonePercentage = 0
     @JvmField var oscOpacity = 0
     var stretchVideo = false
+
+    // ------------------------------------------------------------- OLED burn-in
+    // Client-side only: they shift the local view and fade a local black layer.
+    // Nothing here touches the stream, the host, or the coordinates sent to it.
+    /** Shift the image a few pixels while idle so static UI stops cooking one set of subpixels. */
+    var oledPixelShiftEnabled = true
+    /** Maximum shift, in display pixels, on each axis. */
+    var oledPixelShiftAmplitude = 3
+    /** Seconds between shift steps while idle. */
+    var oledPixelShiftIntervalSec = 60
+    /** Minutes without input before the screen dims. 0 disables dimming. */
+    var oledIdleDimMinutes = 5
+
+    // ------------------------------------------------------------- S Pen button
+    /** Master switch for the barrel button gestures. */
+    var penButtonEnabled = true
+    /** Hold duration that opens the wheel instead of counting as a tap. */
+    var penButtonLongPressMs = 280L
+    /** Tap alternates between these two actions. */
+    var penButtonClickToolA: PenWheelAction = PenWheelAction.BRUSH
+    var penButtonClickToolB: PenWheelAction = PenWheelAction.ERASER
+    /** What each wheel slot fires. */
+    var penWheelSlots: List<PenWheelAction> = PenWheelAction.defaultSlots
     var enableSops = false
     var playHostAudio = false
     var disableWarnings = false
@@ -574,6 +598,15 @@ class PreferenceConfiguration {
         private const val ADAPTIVE_BITRATE_PREF_STRING = "checkbox_adaptive_bitrate"
         private const val ABR_MODE_PREF_STRING = "list_abr_mode"
         private const val STRETCH_PREF_STRING = "checkbox_stretch_video"
+        private const val OLED_SHIFT_PREF_STRING = "checkbox_oled_pixel_shift"
+        private const val OLED_SHIFT_AMPLITUDE_PREF_STRING = "list_oled_pixel_shift_amplitude"
+        private const val OLED_SHIFT_INTERVAL_PREF_STRING = "list_oled_pixel_shift_interval"
+        private const val OLED_IDLE_DIM_PREF_STRING = "list_oled_idle_dim"
+        private const val PEN_BUTTON_PREF_STRING = "checkbox_pen_button"
+        private const val PEN_BUTTON_CLICK_A_PREF_STRING = "list_pen_button_click_a"
+        private const val PEN_BUTTON_CLICK_B_PREF_STRING = "list_pen_button_click_b"
+        private const val PEN_BUTTON_HOLD_PREF_STRING = "list_pen_button_hold"
+        private const val PEN_WHEEL_SLOT_PREF_PREFIX = "list_pen_wheel_slot_"
         private const val SOPS_PREF_STRING = "checkbox_enable_sops"
         private const val DISABLE_TOASTS_PREF_STRING = "checkbox_disable_warnings"
         private const val HOST_AUDIO_PREF_STRING = "checkbox_host_audio"
@@ -755,6 +788,15 @@ class PreferenceConfiguration {
 
         // ---- Default values (private) ----
         private const val DEFAULT_STRETCH = false
+        // OLED burn-in defaults: 3 px every 60 s while idle, and dim after 5
+        // minutes without input. Both are deliberately gentle -- a bigger jump
+        // is not usefully better and is far easier to notice.
+        private const val DEFAULT_OLED_SHIFT = true
+        private const val DEFAULT_OLED_SHIFT_AMPLITUDE = 3
+        private const val DEFAULT_OLED_SHIFT_INTERVAL_SEC = 60
+        private const val DEFAULT_OLED_IDLE_DIM_MIN = 5
+        private const val DEFAULT_PEN_BUTTON = true
+        private const val DEFAULT_PEN_BUTTON_HOLD_MS = 280L
         private const val DEFAULT_SOPS = true
         private const val DEFAULT_DISABLE_TOASTS = false
         private const val DEFAULT_HOST_AUDIO = false
@@ -1443,6 +1485,38 @@ class PreferenceConfiguration {
             config.fixMouseWheel = prefs.getBoolean("checkbox_mouse_wheel", false)
             config.enableSops = prefs.getBoolean(SOPS_PREF_STRING, DEFAULT_SOPS)
             config.stretchVideo = prefs.getBoolean(STRETCH_PREF_STRING, DEFAULT_STRETCH)
+
+            // ListPreference values are stored as strings. The entries are ours,
+            // so an int that fails to parse simply means "fall back".
+            val intPref = { key: String, fallback: Int ->
+                prefs.getString(key, null)?.toIntOrNull() ?: fallback
+            }
+            config.oledPixelShiftEnabled = prefs.getBoolean(OLED_SHIFT_PREF_STRING, DEFAULT_OLED_SHIFT)
+            config.oledPixelShiftAmplitude = intPref(
+                OLED_SHIFT_AMPLITUDE_PREF_STRING, DEFAULT_OLED_SHIFT_AMPLITUDE
+            ).coerceIn(0, 6)
+            config.oledPixelShiftIntervalSec = intPref(
+                OLED_SHIFT_INTERVAL_PREF_STRING, DEFAULT_OLED_SHIFT_INTERVAL_SEC
+            ).coerceIn(10, 600)
+            config.oledIdleDimMinutes = intPref(
+                OLED_IDLE_DIM_PREF_STRING, DEFAULT_OLED_IDLE_DIM_MIN
+            ).coerceIn(0, 60)
+
+            config.penButtonEnabled = prefs.getBoolean(PEN_BUTTON_PREF_STRING, DEFAULT_PEN_BUTTON)
+            config.penButtonLongPressMs = intPref(
+                PEN_BUTTON_HOLD_PREF_STRING, DEFAULT_PEN_BUTTON_HOLD_MS.toInt()
+            ).toLong().coerceIn(120L, 800L)
+            config.penButtonClickToolA = PenWheelAction.fromPref(
+                prefs.getString(PEN_BUTTON_CLICK_A_PREF_STRING, PenWheelAction.BRUSH.prefValue)
+            )
+            config.penButtonClickToolB = PenWheelAction.fromPref(
+                prefs.getString(PEN_BUTTON_CLICK_B_PREF_STRING, PenWheelAction.ERASER.prefValue)
+            )
+            config.penWheelSlots = PenWheelAction.defaultSlots.mapIndexed { index, fallback ->
+                PenWheelAction.fromPref(
+                    prefs.getString(PEN_WHEEL_SLOT_PREF_PREFIX + (index + 1), fallback.prefValue)
+                )
+            }
             config.playHostAudio = prefs.getBoolean(HOST_AUDIO_PREF_STRING, DEFAULT_HOST_AUDIO)
             config.smallIconMode = prefs.getBoolean(SMALL_ICONS_PREF_STRING, getDefaultSmallMode(context))
             config.multiController = prefs.getBoolean(MULTI_CONTROLLER_PREF_STRING, DEFAULT_MULTI_CONTROLLER)

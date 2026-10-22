@@ -28,6 +28,12 @@ class PanZoomHandler(
     private var childHeight = 0f
     private var imeOffsetY = 0f
     private var userTransformActive = false
+    // OLED burn-in mitigation offset, in parent pixels, maintained by OledBurnInGuard.
+    // Kept separate from childX/childY so pan, zoom, IME and surface-change logic
+    // all keep reasoning about the user's own transform: the burn-in offset is
+    // added only at render time and never fed back into those calculations.
+    private var burnInX = 0f
+    private var burnInY = 0f
     var onUserTransform: (() -> Unit)? = null
 
     init {
@@ -78,15 +84,39 @@ class PanZoomHandler(
     }
 
     private fun applyTransform() {
+        // The burn-in offset is in parent pixels and View.x/y are parent-space
+        // too, so it must not be divided by scaleFactor: the view's own scale
+        // is applied around its pivot and never re-scales its position.
         streamView.scaleX = scaleFactor
         streamView.scaleY = scaleFactor
-        streamView.x = childX
-        streamView.y = childY + imeOffsetY
+        streamView.x = childX + burnInX
+        streamView.y = childY + imeOffsetY + burnInY
 
+        // The overlay has to move with the video or the locally drawn cursor
+        // would drift away from the cursor the host renders into the stream.
         cursorOverlay.scaleX = scaleFactor
         cursorOverlay.scaleY = scaleFactor
-        cursorOverlay.x = childX
-        cursorOverlay.y = childY + imeOffsetY
+        cursorOverlay.x = childX + burnInX
+        cursorOverlay.y = childY + imeOffsetY + burnInY
+    }
+
+    /**
+     * Nudge the image while idle so a static toolbar stops cooking the same
+     * subpixels forever. Safe to call at any time; no-op if unchanged.
+     *
+     * Why this needs no input compensation: MotionEvent coordinates are
+     * relative to the view's own top-left, and the view's content moves with
+     * the view, so the pixel under the finger keeps the same local coordinate.
+     * Translation is a pure offset -- unlike scale, which is exactly why the
+     * pan/zoom code above needs pivot maths and this does not.
+     */
+    fun setBurnInOffset(offsetX: Int, offsetY: Int) {
+        val fx = offsetX.toFloat()
+        val fy = offsetY.toFloat()
+        if (burnInX == fx && burnInY == fy) return
+        burnInX = fx
+        burnInY = fy
+        applyTransform()
     }
 
     fun setImeOffsetY(offsetY: Float) {

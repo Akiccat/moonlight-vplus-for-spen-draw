@@ -479,6 +479,29 @@ class KeyboardInputHandler(private val game: Game) {
     /**
      * EvdevListener 键盘事件处理，从 Game.keyboardEvent() 委托。
      */
+    /**
+     * Fires a complete shortcut: one key down/up pair carrying the modifier mask.
+     *
+     * Sunshine synthesises the modifier keys on the host from that mask, so we
+     * never hold a real modifier here. That keeps this usable from a pen button
+     * without disturbing the modifier state a physical keyboard may be holding,
+     * and without leaving a modifier stuck down if the host drops a packet.
+     */
+    fun sendShortcut(action: com.limelight.binding.input.PenWheelAction) {
+        if (!action.sendsKey) return
+        val keyMap = keyboardTranslator.translate(action.androidKeyCode, -1)
+        if (keyMap.toInt() == 0) return
+
+        var modifiers = 0
+        if (action.ctrl) modifiers = modifiers or KeyboardPacket.MODIFIER_CTRL.toInt()
+        if (action.shift) modifiers = modifiers or KeyboardPacket.MODIFIER_SHIFT.toInt()
+        if (action.alt) modifiers = modifiers or KeyboardPacket.MODIFIER_ALT.toInt()
+        val mask = modifiers.toByte()
+
+        game.conn?.sendKeyboardInput(keyMap, KeyboardPacket.KEY_DOWN, mask, 0.toByte())
+        game.conn?.sendKeyboardInput(keyMap, KeyboardPacket.KEY_UP, mask, 0.toByte())
+    }
+
     fun keyboardEvent(buttonDown: Boolean, keyCode: Short) {
         val keyMap = keyboardTranslator.translate(keyCode.toInt(), -1)
         if (keyMap.toInt() != 0) {
