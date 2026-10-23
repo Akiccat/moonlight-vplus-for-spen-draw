@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The project only ships a right-pointing chevron; this is the same asset
+     rotated to point down, for "expanded" state. -->
+<rotate xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_chevron_right_accent"
+    android:fromDegrees="90"
+    android:toDegrees="90"
+    android:pivotX="50%"
+    android:pivotY="50%" />

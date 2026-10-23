@@ -4961,11 +4961,17 @@ class StreamSettings : ThemedAppCompatActivity() {
 
         private var penWheelCategory: PreferenceCategory? = null
         /**
-         * Every slot lives one level down. Eight slots inlined into the S Pen
-         * category buried the four settings above them under ~24 rows, so the
-         * parent now shows a single row that only reports the count.
+         * Slots are hidden behind a single row until the user opens it. Eight
+         * slots inlined into the S Pen category buried the four settings above
+         * them under ~24 rows.
+         *
+         * Expansion happens in place rather than through a nested
+         * PreferenceScreen: navigating to one requires the host to implement
+         * OnPreferenceStartScreenCallback, which this screen does not, so the
+         * row would silently do nothing when tapped.
          */
-        private var penWheelSlotScreen: PreferenceScreen? = null
+        private var penWheelExpanded = false
+        private val penWheelRows = mutableListOf<Preference>()
         private val penWheelAddSlotKey = "pen_wheel_add_slot"
 
         private fun setupPenWheelPreferences() {
@@ -4973,24 +4979,38 @@ class StreamSettings : ThemedAppCompatActivity() {
             rebuildPenWheelSlots()
         }
 
-        /** Rebuilds the slot sub-screen: one header + tool + color per slot, then "add". */
+        /** Rebuilds the collapsible slot section: one header + tool + color per slot, then "add". */
         private fun rebuildPenWheelSlots() {
             val category = penWheelCategory ?: return
             val context = requireContext()
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
 
-            val screen = penWheelSlotScreen ?: preferenceManager.createPreferenceScreen(context).apply {
-                key = "pen_wheel_slots_screen"
-                order = 100
-                penWheelSlotScreen = this
-                category.addPreference(this)
-            }
-            screen.removeAll()
+            penWheelRows.forEach { category.removePreference(it) }
+            penWheelRows.clear()
 
             val count = readPenWheelSlotCount(prefs)
             val max = PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
-            screen.title = context.getString(R.string.title_pen_wheel_slots_entry, count)
-            screen.summary = context.getString(R.string.summary_pen_wheel_slots_entry, count, max)
+
+            val entry = Preference(context).apply {
+                key = "pen_wheel_slots_entry"
+                isPersistent = false
+                order = 100
+                title = context.getString(R.string.title_pen_wheel_slots_entry, count)
+                summary = context.getString(R.string.summary_pen_wheel_slots_entry, count, max)
+                setIcon(
+                    if (penWheelExpanded) R.drawable.ic_chevron_down_accent
+                    else R.drawable.ic_chevron_right_accent
+                )
+                onPreferenceClickListener = Preference.OnPreferenceClickListener {
+                    penWheelExpanded = !penWheelExpanded
+                    rebuildPenWheelSlots()
+                    true
+                }
+            }
+            category.addPreference(entry)
+            penWheelRows += entry
+
+            if (!penWheelExpanded) return
 
             val actionNames = context.resources.getTextArray(R.array.pen_wheel_action_names)
             val actionValues = context.resources.getTextArray(R.array.pen_wheel_action_values)
@@ -5006,7 +5026,7 @@ class StreamSettings : ThemedAppCompatActivity() {
                 val slot = PenWheelSlotCategory(context).apply {
                     key = "pen_wheel_slot_category_$index"
                     title = context.getString(R.string.title_pen_wheel_slot_group, index)
-                    order = index * 10
+                    order = 100 + index * 10
                     canRemove = count > PreferenceConfiguration.MIN_PEN_WHEEL_COUNT
                     onRemove = {
                         removePenWheelSlot(prefs, index)
@@ -5016,7 +5036,8 @@ class StreamSettings : ThemedAppCompatActivity() {
 
                 // Attach the group before adding children: a Preference can only
                 // take children once it has a PreferenceManager.
-                screen.addPreference(slot)
+                category.addPreference(slot)
+                penWheelRows += slot
 
                 slot.addPreference(PenWheelListPreference(context).apply {
                     key = "list_pen_wheel_slot_$index"
@@ -5035,11 +5056,11 @@ class StreamSettings : ThemedAppCompatActivity() {
 
             // Adding a slot is the main action of this screen, so it gets a
             // category-sized title instead of the small one a normal row uses.
-            screen.addPreference(Preference(context).apply {
+            val addRow = Preference(context).apply {
                 key = penWheelAddSlotKey
                 layoutResource = R.layout.preference_action_big_title
                 isPersistent = false
-                order = (count + 1) * 10
+                order = 100 + (count + 1) * 10
                 title = context.getString(R.string.title_pen_wheel_add_slot)
                 summary = context.getString(R.string.summary_pen_wheel_add_slot, count, max)
                 isEnabled = count < max
@@ -5048,7 +5069,9 @@ class StreamSettings : ThemedAppCompatActivity() {
                     rebuildPenWheelSlots()
                     true
                 }
-            })
+            }
+            category.addPreference(addRow)
+            penWheelRows += addRow
         }
 
         private fun readPenWheelSlotCount(prefs: SharedPreferences): Int {
