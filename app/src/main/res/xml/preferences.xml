@@ -1247,11 +1247,13 @@
         android:layout="@layout/preference_category_material">
         <CheckBoxPreference
             android:key="checkbox_pen_button"
+            android:order="0"
             android:title="@string/title_checkbox_pen_button"
             android:summary="@string/summary_checkbox_pen_button"
             android:defaultValue="true" />
         <ListPreference
             android:key="list_pen_button_click_a"
+            android:order="1"
             android:title="@string/title_pen_button_click_a"
             android:summary="@string/summary_pen_button_click"
             android:entries="@array/pen_wheel_action_names"
@@ -1259,6 +1261,7 @@
             android:defaultValue="brush" />
         <ListPreference
             android:key="list_pen_button_click_b"
+            android:order="2"
             android:title="@string/title_pen_button_click_b"
             android:summary="@string/summary_pen_button_click"
             android:entries="@array/pen_wheel_action_names"
@@ -1266,66 +1269,12 @@
             android:defaultValue="eraser" />
         <ListPreference
             android:key="list_pen_button_hold"
+            android:order="3"
             android:title="@string/title_pen_button_hold"
             android:summary="@string/summary_pen_button_hold"
             android:entries="@array/pen_button_hold_names"
             android:entryValues="@array/pen_button_hold_values"
             android:defaultValue="280" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_1"
-            android:title="@string/title_pen_wheel_slot_1"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="brush" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_2"
-            android:title="@string/title_pen_wheel_slot_2"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="eraser" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_3"
-            android:title="@string/title_pen_wheel_slot_3"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="pencil" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_4"
-            android:title="@string/title_pen_wheel_slot_4"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="eyedropper" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_5"
-            android:title="@string/title_pen_wheel_slot_5"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="hand" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_6"
-            android:title="@string/title_pen_wheel_slot_6"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="undo" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_7"
-            android:title="@string/title_pen_wheel_slot_7"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="redo" />
-        <ListPreference
-            android:key="list_pen_wheel_slot_8"
-            android:title="@string/title_pen_wheel_slot_8"
-            android:summary="@string/summary_pen_wheel_slot"
-            android:entries="@array/pen_wheel_action_names"
-            android:entryValues="@array/pen_wheel_action_values"
-            android:defaultValue="zoom_fit" />
+
     </PreferenceCategory>
 </PreferenceScreen>

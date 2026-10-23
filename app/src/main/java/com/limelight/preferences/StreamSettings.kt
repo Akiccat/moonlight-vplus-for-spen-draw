@@ -87,6 +87,8 @@ import com.limelight.nvstream.http.AdaptiveBitrateService
 import com.limelight.ExternalDisplayManager
 import com.limelight.TargetDisplayResolver
 import com.limelight.binding.input.InputDeviceSensorPolicy
+import com.limelight.binding.input.PenWheelAction
+import com.limelight.binding.input.PenWheelColor
 import com.limelight.binding.input.advance_setting.config.PageConfigController
 import com.limelight.binding.audio.MicrophoneButtonPreferences
 import com.limelight.binding.audio.MicrophoneButtonPositionStore
@@ -1672,6 +1674,8 @@ class StreamSettings : ThemedAppCompatActivity() {
                     // 装 SummaryProvider 会与其 super.setSummary 调用互斥。
                     // 命中说明改由它在拼接时询问，避免被当成新的原始说明保存。
                     child is IconListPreference -> child.searchMatchNoteProvider = { searchMatchNote(child) }
+                    // Owns its summary; wrapping it here would repeat the value.
+                    child is PenWheelListPreference -> Unit
                     child is ListPreference -> applyHighlightedSummary(child, valueText, disabledAccent) {
                         val entry = it.entry?.toString()
                         if (entry.isNullOrBlank()) "—" else entry
@@ -3505,6 +3509,7 @@ class StreamSettings : ThemedAppCompatActivity() {
             setupMicVolumeProcessingPreferences()
             setupInputModePresetPreference()
             setupPerfOverlayPreferences()
+            setupPenWheelPreferences()
             setupMicrophoneButtonPositionPreference()
             setupFloatBallPositionPreference()
             setupLegacyBackedModeSelectors()
@@ -4952,6 +4957,143 @@ class StreamSettings : ThemedAppCompatActivity() {
                     updateClockFormatEnabled(newValue as? Set<*>)
                     true
                 }
+        }
+
+        private var penWheelCategory: PreferenceCategory? = null
+        private val penWheelSlotCategories = mutableListOf<PenWheelSlotCategory>()
+        private val penWheelAddSlotKey = "pen_wheel_add_slot"
+
+        private fun setupPenWheelPreferences() {
+            penWheelCategory = findPreference("category_pen_button") ?: return
+            rebuildPenWheelSlots()
+        }
+
+        /** Slots are built on demand: one header + tool + color per slot, plus an "add" row. */
+        private fun rebuildPenWheelSlots() {
+            val category = penWheelCategory ?: return
+            val context = requireContext()
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+
+            penWheelSlotCategories.forEach { category.removePreference(it) }
+            penWheelSlotCategories.clear()
+            findPreference<Preference>(penWheelAddSlotKey)?.let { category.removePreference(it) }
+
+            val count = readPenWheelSlotCount(prefs)
+            val actionNames = context.resources.getTextArray(R.array.pen_wheel_action_names)
+            val actionValues = context.resources.getTextArray(R.array.pen_wheel_action_values)
+            val colorNames = context.resources.getTextArray(R.array.pen_wheel_color_names)
+            val colorValues = context.resources.getTextArray(R.array.pen_wheel_color_values)
+
+            for (index in 1..count) {
+                val slot = PenWheelSlotCategory(context).apply {
+                    key = "pen_wheel_slot_category_$index"
+                    title = context.getString(R.string.title_pen_wheel_slot_group, index)
+                    order = 10 + index * 10
+                    canRemove = count > PreferenceConfiguration.MIN_PEN_WHEEL_COUNT
+                    onRemove = {
+                        removePenWheelSlot(prefs, index)
+                        rebuildPenWheelSlots()
+                    }
+                }
+
+                seedPenWheelValue(
+                    prefs,
+                    "list_pen_wheel_slot_$index",
+                    PenWheelAction.defaultSlots.getOrElse(index - 1) { PenWheelAction.NONE }.prefValue
+                )
+                seedPenWheelValue(prefs, "list_pen_wheel_color_$index", PenWheelColor.DEFAULT.prefValue)
+
+                // Attach the group before adding children: a Preference can only
+                // take children once it has a PreferenceManager.
+                category.addPreference(slot)
+                penWheelSlotCategories += slot
+
+                slot.addPreference(PenWheelListPreference(context).apply {
+                    key = "list_pen_wheel_slot_$index"
+                    order = 0
+                    title = context.getString(R.string.title_pen_wheel_slot_action)
+                    setDescription(context.getString(R.string.summary_pen_wheel_slot))
+                    setEntries(actionNames)
+                    setEntryValues(actionValues)
+                })
+                slot.addPreference(PenWheelListPreference(context).apply {
+                    key = "list_pen_wheel_color_$index"
+                    order = 1
+                    title = context.getString(R.string.title_pen_wheel_color)
+                    setDescription(context.getString(R.string.summary_pen_wheel_color))
+                    setEntries(colorNames)
+                    setEntryValues(colorValues)
+                })
+            }
+
+            category.addPreference(Preference(context).apply {
+                key = penWheelAddSlotKey
+                isPersistent = false
+                order = 10 + (count + 1) * 10
+                title = context.getString(R.string.title_pen_wheel_add_slot)
+                summary = context.getString(
+                    R.string.summary_pen_wheel_add_slot,
+                    count,
+                    PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
+                )
+                isEnabled = count < PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
+                onPreferenceClickListener = Preference.OnPreferenceClickListener {
+                    addPenWheelSlot(prefs)
+                    rebuildPenWheelSlots()
+                    true
+                }
+            })
+        }
+
+        private fun readPenWheelSlotCount(prefs: SharedPreferences): Int {
+            val stored = prefs.getString(PreferenceConfiguration.PEN_WHEEL_COUNT_PREF_STRING, null)
+                ?.toIntOrNull() ?: PreferenceConfiguration.DEFAULT_PEN_WHEEL_COUNT
+            return stored.coerceIn(
+                PreferenceConfiguration.MIN_PEN_WHEEL_COUNT,
+                PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
+            )
+        }
+
+        private fun seedPenWheelValue(prefs: SharedPreferences, key: String, value: String) {
+            if (!prefs.contains(key)) {
+                prefs.edit().putString(key, value).apply()
+            }
+        }
+
+        private fun addPenWheelSlot(prefs: SharedPreferences) {
+            val count = readPenWheelSlotCount(prefs)
+            if (count >= PreferenceConfiguration.MAX_PEN_WHEEL_COUNT) return
+            val next = count + 1
+            val fallback = PenWheelAction.defaultSlots.getOrElse(next - 1) { PenWheelAction.NONE }
+            prefs.edit()
+                .putString("list_pen_wheel_slot_$next", fallback.prefValue)
+                .putString("list_pen_wheel_color_$next", PenWheelColor.DEFAULT.prefValue)
+                .putString(PreferenceConfiguration.PEN_WHEEL_COUNT_PREF_STRING, next.toString())
+                .apply()
+        }
+
+        /** Removes a slot and shifts the following ones down so keys stay contiguous. */
+        private fun removePenWheelSlot(prefs: SharedPreferences, index: Int) {
+            val count = readPenWheelSlotCount(prefs)
+            if (count <= PreferenceConfiguration.MIN_PEN_WHEEL_COUNT) return
+            val editor = prefs.edit()
+            for (i in index until count) {
+                editor.putString(
+                    "list_pen_wheel_slot_$i",
+                    prefs.getString("list_pen_wheel_slot_${i + 1}", PenWheelAction.NONE.prefValue)
+                )
+                editor.putString(
+                    "list_pen_wheel_color_$i",
+                    prefs.getString("list_pen_wheel_color_${i + 1}", PenWheelColor.DEFAULT.prefValue)
+                )
+            }
+            editor.remove("list_pen_wheel_slot_$count")
+            editor.remove("list_pen_wheel_color_$count")
+            editor.putString(
+                PreferenceConfiguration.PEN_WHEEL_COUNT_PREF_STRING,
+                (count - 1).toString()
+            )
+            editor.apply()
         }
 
         private fun refreshDeveloperFeatureGateState() {

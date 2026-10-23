@@ -80,9 +80,9 @@ enum class PenWheelAction(
 
         /** Order the wheel slots ship with. */
         val defaultSlots: List<PenWheelAction> = listOf(
-            BRUSH, ERASER, PENCIL, EYEDROPPER, HAND, UNDO, REDO, ZOOM_FIT
+            BRUSH, ERASER, PENCIL, EYEDROPPER, HAND, UNDO, REDO, ZOOM_FIT, FILL, SAVE
         )
 
-        const val SLOT_COUNT = 8
+        const val SLOT_COUNT = 10
     }
 }

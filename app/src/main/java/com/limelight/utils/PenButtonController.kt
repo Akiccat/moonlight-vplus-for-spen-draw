@@ -46,6 +46,7 @@ class PenButtonController(
 
     private var buttonDown = false
     private var downAt = 0L
+    private var lastEventAt = 0L
     private var wheelOpen = false
     private var selection = -1
     private var centerX = 0f
@@ -55,11 +56,28 @@ class PenButtonController(
     /** Which half of the click toggle fires next. */
     private var nextIsA = true
 
-    private val openWheel = Runnable {
+    private val openWheel: Runnable = Runnable {
         if (!buttonDown) return@Runnable
         wheelOpen = true
         selection = -1
+        lastEventAt = SystemClock.uptimeMillis()
         listener.showWheel(centerX, centerY, radius)
+        // Safety net: a release can be lost when the pen leaves the sensing
+        // range first, which would otherwise leave the wheel on screen forever.
+        handler.postDelayed(autoClose, IDLE_CLOSE_MS)
+    }
+
+    private val autoClose: Runnable = Runnable {
+        if (!wheelOpen) return@Runnable
+        val idle = SystemClock.uptimeMillis() - lastEventAt
+        if (idle >= IDLE_CLOSE_MS) {
+            // The release may never arrive; forget the press so the pen works again.
+            buttonDown = false
+            handler.removeCallbacks(openWheel)
+            dismissWheel()
+        } else {
+            handler.postDelayed(autoClose, IDLE_CLOSE_MS - idle)
+        }
     }
 
     fun setViewport(width: Int, height: Int) {
@@ -78,10 +96,26 @@ class PenButtonController(
         val pressed = (event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0
         val x = event.x
         val y = event.y
+        lastEventAt = SystemClock.uptimeMillis()
+
+        // The pen left the digitizer's range: no further events (including the
+        // button release) are guaranteed, so end the gesture here instead of
+        // leaving the wheel up until the pen comes back.
+        if (event.actionMasked == MotionEvent.ACTION_HOVER_EXIT) {
+            val wasActive = buttonDown || wheelOpen
+            handler.removeCallbacks(openWheel)
+            buttonDown = false
+            if (wheelOpen) dismissWheel()
+            if (wasActive) return true
+        }
 
         // Keep the last pen position even while the button is not involved, so
         // the wheel can appear where the pen already is.
-        if (event.actionMasked != MotionEvent.ACTION_HOVER_EXIT) {
+        //
+        // Stop following once the wheel is open: it is anchored where it was
+        // drawn, and a moving centre would make every sample land in the dead
+        // zone, so no sector could ever be selected.
+        if (!wheelOpen && event.actionMasked != MotionEvent.ACTION_HOVER_EXIT) {
             centerX = clampCenter(x, viewportW, radius)
             centerY = clampCenter(y, viewportH, radius)
         }
@@ -109,11 +143,13 @@ class PenButtonController(
         if (wheelOpen) {
             // Hovering selects; touching the screen confirms immediately, which
             // is what "tap to select" means for a pen that is already down.
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                updateSelectionFromPoint(x, y)
-                commit()
-            } else {
-                updateSelectionFromPoint(x, y)
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    updateSelectionFromPoint(x, y)
+                    commit()
+                }
+                MotionEvent.ACTION_CANCEL -> dismissWheel()
+                else -> updateSelectionFromPoint(x, y)
             }
             return true
         }
@@ -127,10 +163,7 @@ class PenButtonController(
     fun cancel() {
         handler.removeCallbacks(openWheel)
         buttonDown = false
-        if (wheelOpen) {
-            wheelOpen = false
-            listener.hideWheel()
-        }
+        if (wheelOpen) dismissWheel()
     }
 
     private fun fireToggle() {
@@ -144,27 +177,52 @@ class PenButtonController(
         val dy = y - centerY
         val dist = hypot(dx, dy)
 
-        val next = if (dist < radius * CENTER_DEAD_ZONE || slots.isEmpty()) {
-            -1 // hovering the hub cancels, like every radial menu
-        } else {
-            val angle = Math.toDegrees(atan2(dy, dx).toDouble()).toFloat()
-            val slice = 360f / slots.size
-            // Slot 0 sits at the top, so rotate -90deg into the 0..360 range.
-            val normalized = (angle + 90f + 360f) % 360f
-            ((normalized + slice / 2f) / slice).toInt() % slots.size
+        if (slots.isEmpty()) {
+            setSelection(-1)
+            return
         }
 
-        if (next != selection) {
-            selection = next
-            listener.updateSelection(next)
+        if (dist < radius * CENTER_DEAD_ZONE) {
+            setSelection(-1) // hovering the hub cancels, like every radial menu
+            return
         }
+
+        val slice = 360f / slots.size
+        val angle = Math.toDegrees(atan2(dy, dx).toDouble()).toFloat()
+        // Slot 0 sits at the top, so rotate -90deg into the 0..360 range.
+        val normalized = (angle + 90f + 360f) % 360f
+        val raw = ((normalized + slice / 2f) / slice).toInt() % slots.size
+
+        // Hysteresis: a neighbouring sector only takes over once the pen is a
+        // few degrees past the divider, so jitter on the boundary cannot make
+        // the highlight flicker between two slots.
+        val intoSector = Math.abs(((normalized - raw * slice + 540f) % 360f) - 180f)
+        val next = when {
+            raw == selection -> selection
+            selection < 0 -> raw
+            intoSector > slice / 2f - HYSTERESIS_DEG -> raw
+            else -> selection
+        }
+        setSelection(next)
+    }
+
+    private fun setSelection(index: Int) {
+        if (index != selection) {
+            selection = index
+            listener.updateSelection(index)
+        }
+    }
+
+    private fun dismissWheel() {
+        handler.removeCallbacks(autoClose)
+        wheelOpen = false
+        selection = -1
+        listener.hideWheel()
     }
 
     private fun commit() {
         val index = selection
-        wheelOpen = false
-        selection = -1
-        listener.hideWheel()
+        dismissWheel()
         if (index in slots.indices) {
             val action = slots[index]
             if (action.sendsKey) listener.fire(action)
@@ -179,7 +237,16 @@ class PenButtonController(
 
     companion object {
         /** Fraction of the radius that counts as "the hub", i.e. cancel. */
-        private const val CENTER_DEAD_ZONE = 0.24f
+        private const val CENTER_DEAD_ZONE = 0.27f
+
+        /**
+         * Degrees the pen must travel past a divider before the neighbouring
+         * sector wins, so a jittery hover cannot flicker between two slots.
+         */
+        private const val HYSTERESIS_DEG = 3f
+
+        /** No pen event for this long while the wheel is up means the gesture is over. */
+        private const val IDLE_CLOSE_MS = 2500L
 
         fun defaultSlots(): List<PenWheelAction> = PenWheelAction.defaultSlots
     }

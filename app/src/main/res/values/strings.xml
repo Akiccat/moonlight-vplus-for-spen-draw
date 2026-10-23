@@ -2426,14 +2426,6 @@ Tap again to replace it.</string>
     <string name="pen_button_hold_280">280 ms</string>
     <string name="pen_button_hold_400">400 ms</string>
     <string name="pen_button_hold_600">600 ms</string>
-    <string name="title_pen_wheel_slot_1">Wheel slot 1 (top)</string>
-    <string name="title_pen_wheel_slot_2">Wheel slot 2</string>
-    <string name="title_pen_wheel_slot_3">Wheel slot 3</string>
-    <string name="title_pen_wheel_slot_4">Wheel slot 4</string>
-    <string name="title_pen_wheel_slot_5">Wheel slot 5</string>
-    <string name="title_pen_wheel_slot_6">Wheel slot 6</string>
-    <string name="title_pen_wheel_slot_7">Wheel slot 7</string>
-    <string name="title_pen_wheel_slot_8">Wheel slot 8</string>
     <string name="summary_pen_wheel_slot">Sent to the PC as a keystroke, so anything the drawing app binds to a key works.</string>
     <string name="pen_wheel_action_none">Do nothing</string>
     <string name="pen_wheel_action_brush">Brush</string>
@@ -2454,4 +2446,22 @@ Tap again to replace it.</string>
     <string name="pen_wheel_key_ctrl">Ctrl</string>
     <string name="pen_wheel_key_shift">Shift</string>
     <string name="pen_wheel_key_alt">Alt</string>
+    <string name="summary_pen_wheel_color">Color of this sector while it is highlighted. Unselected sectors stay dark gray.</string>
+    <string name="title_pen_wheel_slot_group">Slot %1$d</string>
+    <string name="title_pen_wheel_slot_action">Tool</string>
+    <string name="title_pen_wheel_color">Color</string>
+    <string name="title_pen_wheel_add_slot">Add a slot</string>
+    <string name="summary_pen_wheel_add_slot">The wheel currently has %1$d slots (up to %2$d).</string>
+    <string name="title_pen_wheel_remove_slot">Remove this slot</string>
+    <string name="pen_wheel_color_amber">Amber</string>
+    <string name="pen_wheel_color_coral">Coral</string>
+    <string name="pen_wheel_color_crimson">Crimson</string>
+    <string name="pen_wheel_color_rose">Rose</string>
+    <string name="pen_wheel_color_violet">Violet</string>
+    <string name="pen_wheel_color_blue">Blue</string>
+    <string name="pen_wheel_color_cyan">Cyan</string>
+    <string name="pen_wheel_color_teal">Teal</string>
+    <string name="pen_wheel_color_green">Green</string>
+    <string name="pen_wheel_color_lime">Lime</string>
+    <string name="pen_wheel_color_white">White</string>
 </resources>

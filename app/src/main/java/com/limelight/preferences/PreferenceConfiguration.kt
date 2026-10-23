@@ -15,6 +15,7 @@ import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.preference.PreferenceManager
 import com.limelight.binding.input.PenWheelAction
+import com.limelight.binding.input.PenWheelColor
 import com.limelight.binding.input.haptics.GameRumbleMode
 import com.limelight.binding.video.DecoderInputBufferMode
 import com.limelight.nvstream.jni.MoonBridge
@@ -143,6 +144,10 @@ class PreferenceConfiguration {
     var penButtonClickToolB: PenWheelAction = PenWheelAction.ERASER
     /** What each wheel slot fires. */
     var penWheelSlots: List<PenWheelAction> = PenWheelAction.defaultSlots
+    /** How many of those slots are actually shown. */
+    var penWheelSlotCount = DEFAULT_PEN_WHEEL_COUNT
+    /** Highlight color of each slot, as ARGB. */
+    var penWheelColors: List<Int> = List(DEFAULT_PEN_WHEEL_COUNT) { PenWheelColor.DEFAULT.argb }
     var enableSops = false
     var playHostAudio = false
     var disableWarnings = false
@@ -607,6 +612,11 @@ class PreferenceConfiguration {
         private const val PEN_BUTTON_CLICK_B_PREF_STRING = "list_pen_button_click_b"
         private const val PEN_BUTTON_HOLD_PREF_STRING = "list_pen_button_hold"
         private const val PEN_WHEEL_SLOT_PREF_PREFIX = "list_pen_wheel_slot_"
+        private const val PEN_WHEEL_COLOR_PREF_PREFIX = "list_pen_wheel_color_"
+        const val PEN_WHEEL_COUNT_PREF_STRING = "list_pen_wheel_count"
+        const val DEFAULT_PEN_WHEEL_COUNT = 8
+        const val MIN_PEN_WHEEL_COUNT = 1
+        const val MAX_PEN_WHEEL_COUNT = 16
         private const val SOPS_PREF_STRING = "checkbox_enable_sops"
         private const val DISABLE_TOASTS_PREF_STRING = "checkbox_disable_warnings"
         private const val HOST_AUDIO_PREF_STRING = "checkbox_host_audio"
@@ -1512,10 +1522,20 @@ class PreferenceConfiguration {
             config.penButtonClickToolB = PenWheelAction.fromPref(
                 prefs.getString(PEN_BUTTON_CLICK_B_PREF_STRING, PenWheelAction.ERASER.prefValue)
             )
-            config.penWheelSlots = PenWheelAction.defaultSlots.mapIndexed { index, fallback ->
+            val slotCount = intPref(
+                PEN_WHEEL_COUNT_PREF_STRING, DEFAULT_PEN_WHEEL_COUNT
+            ).coerceIn(MIN_PEN_WHEEL_COUNT, MAX_PEN_WHEEL_COUNT)
+            config.penWheelSlotCount = slotCount
+            config.penWheelSlots = (0 until slotCount).map { index ->
+                val fallback = PenWheelAction.defaultSlots.getOrElse(index) { PenWheelAction.NONE }
                 PenWheelAction.fromPref(
                     prefs.getString(PEN_WHEEL_SLOT_PREF_PREFIX + (index + 1), fallback.prefValue)
                 )
+            }
+            config.penWheelColors = (0 until slotCount).map { index ->
+                PenWheelColor.fromPref(
+                    prefs.getString(PEN_WHEEL_COLOR_PREF_PREFIX + (index + 1), null)
+                ).argb
             }
             config.playHostAudio = prefs.getBoolean(HOST_AUDIO_PREF_STRING, DEFAULT_HOST_AUDIO)
             config.smallIconMode = prefs.getBoolean(SMALL_ICONS_PREF_STRING, getDefaultSmallMode(context))

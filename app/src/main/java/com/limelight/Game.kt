@@ -4,6 +4,7 @@ package com.limelight
 import com.limelight.ui.PenWheelOverlay
 import com.limelight.ui.ThemedComponentActivity
 import com.limelight.binding.input.PenWheelAction
+import com.limelight.binding.input.PenWheelColor
 import com.limelight.binding.input.driver.UsbWaveformBackends
 
 import android.hardware.usb.UsbManager
@@ -238,12 +239,17 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     // S Pen barrel button -> tap toggles a tool, hold opens the radial wheel.
     private var penButtonController: PenButtonController? = null
     private var penWheelView: ComposeView? = null
+    /** Invalidates a pending "hide the layer" post when the wheel reopens. */
+    private var penWheelLayerToken = 0
     private val penWheelVisible = mutableStateOf(false)
     private val penWheelCenterX = mutableStateOf(0f)
     private val penWheelCenterY = mutableStateOf(0f)
     private val penWheelRadius = mutableStateOf(220f)
     private val penWheelSelection = mutableStateOf(-1)
     private val penWheelSlots = mutableStateOf(PenWheelAction.defaultSlots)
+    private val penWheelColors = mutableStateOf(
+        List(PenWheelAction.SLOT_COUNT) { PenWheelColor.DEFAULT.argb }
+    )
     private val pipInteractiveOverlayState = PipInteractiveOverlayState()
     /** Preserve virtual-controller visibility across OEM-specific stop/PiP callback ordering. */
     private var virtualControllerVisibleBeforeStop: Boolean? = null
@@ -3328,6 +3334,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
                     centerY = penWheelCenterY.value,
                     radiusPx = penWheelRadius.value,
                     slots = penWheelSlots.value,
+                    colors = penWheelColors.value,
                     selection = penWheelSelection.value,
                     modifier = Modifier.fillMaxSize()
                 )
@@ -3346,6 +3353,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         if (!prefConfig.penButtonEnabled) return
         val slots = prefConfig.penWheelSlots
         penWheelSlots.value = slots
+        penWheelColors.value = prefConfig.penWheelColors
 
         penButtonController = PenButtonController(
             enabled = true,
@@ -3356,11 +3364,13 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
             listener = object : PenButtonController.Listener {
                 override fun showWheel(centerX: Float, centerY: Float, radius: Float) {
                     runOnUiThread {
+                        penWheelLayerToken++
                         penWheelCenterX.value = centerX
                         penWheelCenterY.value = centerY
                         penWheelRadius.value = radius
                         penWheelSelection.value = -1
                         penWheelVisible.value = true
+                        penWheelView?.alpha = 1f
                         penWheelView?.visibility = View.VISIBLE
                         penWheelView?.bringToFront()
                     }
@@ -3371,7 +3381,19 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
                 }
 
                 override fun hideWheel() {
-                    runOnUiThread { penWheelVisible.value = false }
+                    runOnUiThread {
+                        penWheelVisible.value = false
+                        // Compose does not always repaint an emptied root, which
+                        // leaves the last frame of the wheel on screen. Fade the
+                        // whole layer out once the exit animation is done; alpha
+                        // avoids the relayout hitch that GONE causes mid-stream.
+                        val token = ++penWheelLayerToken
+                        penWheelView?.postDelayed({
+                            if (token == penWheelLayerToken && !penWheelVisible.value) {
+                                penWheelView?.alpha = 0f
+                            }
+                        }, 300)
+                    }
                 }
 
                 override fun fire(action: PenWheelAction) {
