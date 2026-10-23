@@ -2452,7 +2452,10 @@ Tap again to replace it.</string>
     <string name="title_pen_wheel_color">Color</string>
     <string name="title_pen_wheel_add_slot">Add a slot</string>
     <string name="summary_pen_wheel_add_slot">The wheel currently has %1$d slots (up to %2$d).</string>
-    <string name="title_pen_wheel_remove_slot">Remove this slot</string>
+    <!-- Short: this is a button label inside the slot header, not a sentence. -->
+    <string name="title_pen_wheel_remove_slot">Delete</string>
+    <string name="title_pen_wheel_slots_entry">Wheel sectors (%1$d)</string>
+    <string name="summary_pen_wheel_slots_entry">Tap to set each sector\'s action and highlight color. Currently %1$d of at most %2$d.</string>
     <string name="pen_wheel_color_amber">Amber</string>
     <string name="pen_wheel_color_coral">Coral</string>
     <string name="pen_wheel_color_crimson">Crimson</string>

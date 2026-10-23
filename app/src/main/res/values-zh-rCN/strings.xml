@@ -2341,7 +2341,10 @@
     <string name="title_pen_wheel_color">颜色</string>
     <string name="title_pen_wheel_add_slot">添加槽位</string>
     <string name="summary_pen_wheel_add_slot">当前 %1$d 个槽位，最多 %2$d 个。</string>
-    <string name="title_pen_wheel_remove_slot">移除这个槽位</string>
+    <!-- 短些：这是槽位标题栏里的按钮文字，不是句子。 -->
+    <string name="title_pen_wheel_remove_slot">删除</string>
+    <string name="title_pen_wheel_slots_entry">轮盘槽位（%1$d）</string>
+    <string name="summary_pen_wheel_slots_entry">点开配置每个槽位的动作与高亮色。当前 %1$d 个，最多 %2$d 个。</string>
     <string name="pen_wheel_color_amber">琥珀</string>
     <string name="pen_wheel_color_coral">珊瑚</string>
     <string name="pen_wheel_color_crimson">绯红</string>

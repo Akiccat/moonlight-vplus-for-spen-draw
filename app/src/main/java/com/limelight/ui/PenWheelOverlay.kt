@@ -126,10 +126,21 @@ internal fun PenWheelOverlay(
     val labelBandHeight = with(density) { (radiusPx * 0.22f).toDp() }
     val labelBandWidth = with(density) { (radiusPx * 1.05f).toDp() }
 
+    // Hoisted out of the draw lambda: building a Stroke there allocates one per
+    // frame, and the wheel is redrawn on every animation tick.
+    val rimStroke = remember(density) { Stroke(width = with(density) { 1.5.dp.toPx() }) }
+    val chosenStroke = remember(density) { Stroke(width = with(density) { 2.dp.toPx() }) }
+
+    // The scrim fades through graphicsLayer, not through Color.copy(alpha=..):
+    // reading an animated value while building the modifier recomposes this
+    // whole subtree every frame, which would re-run every slot's stringResource
+    // and re-layout ten full-size layers 60 times a second. The draw-phase
+    // lambda below only invalidates drawing.
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(WheelScrim.copy(alpha = 0.42f * scrim.value.coerceIn(0f, 1f)))
+            .background(WheelScrim)
+            .graphicsLayer { alpha = scrim.value.coerceIn(0f, 1f) }
     ) {
         Box(
             modifier = Modifier
@@ -154,7 +165,9 @@ internal fun PenWheelOverlay(
 
                 val slice = 360f / count
                 val gap = 1.4f
-                val startOf = { index: Int -> -90f - slice / 2f + index * slice + gap / 2f }
+                // Precomputed rather than a per-index lambda: this runs on every
+                // draw, and a captured closure would allocate on each frame.
+                val baseAngle = -90f - slice / 2f + gap / 2f
 
                 drawCircle(WheelBacking, radius = r, center = c)
 
@@ -163,7 +176,7 @@ internal fun PenWheelOverlay(
                     if (i == chosen) continue
                     drawArc(
                         color = WheelIdleSector,
-                        startAngle = startOf(i),
+                        startAngle = baseAngle + i * slice,
                         sweepAngle = slice - gap,
                         useCenter = true,
                         topLeft = Offset(c.x - r, c.y - r),
@@ -175,7 +188,7 @@ internal fun PenWheelOverlay(
                     val rr = r * 1.02f * selBoost.value
                     drawArc(
                         color = slotColor(chosen, colors),
-                        startAngle = startOf(chosen),
+                        startAngle = baseAngle + chosen * slice,
                         sweepAngle = slice - gap,
                         useCenter = true,
                         topLeft = Offset(c.x - rr, c.y - rr),
@@ -183,22 +196,22 @@ internal fun PenWheelOverlay(
                     )
                     drawArc(
                         color = WheelRimStrong,
-                        startAngle = startOf(chosen),
+                        startAngle = baseAngle + chosen * slice,
                         sweepAngle = slice - gap,
                         useCenter = true,
                         topLeft = Offset(c.x - rr, c.y - rr),
                         size = Size(rr * 2f, rr * 2f),
-                        style = Stroke(width = 2.dp.toPx())
+                        style = chosenStroke
                     )
                 }
 
-                drawCircle(WheelRim, radius = r, center = c, style = Stroke(width = 1.5.dp.toPx()))
+                drawCircle(WheelRim, radius = r, center = c, style = rimStroke)
                 drawCircle(WheelHub, radius = r * HUB_FRACTION, center = c)
                 drawCircle(
                     WheelRim,
                     radius = r * HUB_FRACTION,
                     center = c,
-                    style = Stroke(width = 1.5.dp.toPx())
+                    style = rimStroke
                 )
             }
 

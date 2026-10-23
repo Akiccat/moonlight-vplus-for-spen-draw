@@ -4960,7 +4960,12 @@ class StreamSettings : ThemedAppCompatActivity() {
         }
 
         private var penWheelCategory: PreferenceCategory? = null
-        private val penWheelSlotCategories = mutableListOf<PenWheelSlotCategory>()
+        /**
+         * Every slot lives one level down. Eight slots inlined into the S Pen
+         * category buried the four settings above them under ~24 rows, so the
+         * parent now shows a single row that only reports the count.
+         */
+        private var penWheelSlotScreen: PreferenceScreen? = null
         private val penWheelAddSlotKey = "pen_wheel_add_slot"
 
         private fun setupPenWheelPreferences() {
@@ -4968,34 +4973,29 @@ class StreamSettings : ThemedAppCompatActivity() {
             rebuildPenWheelSlots()
         }
 
-        /** Slots are built on demand: one header + tool + color per slot, plus an "add" row. */
+        /** Rebuilds the slot sub-screen: one header + tool + color per slot, then "add". */
         private fun rebuildPenWheelSlots() {
             val category = penWheelCategory ?: return
             val context = requireContext()
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
 
-            penWheelSlotCategories.forEach { category.removePreference(it) }
-            penWheelSlotCategories.clear()
-            findPreference<Preference>(penWheelAddSlotKey)?.let { category.removePreference(it) }
+            val screen = penWheelSlotScreen ?: preferenceManager.createPreferenceScreen(context).apply {
+                key = "pen_wheel_slots_screen"
+                order = 100
+                penWheelSlotScreen = this
+                category.addPreference(this)
+            }
+            screen.removeAll()
 
             val count = readPenWheelSlotCount(prefs)
+            val max = PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
+            screen.title = context.getString(R.string.title_pen_wheel_slots_entry, count)
+            screen.summary = context.getString(R.string.summary_pen_wheel_slots_entry, count, max)
+
             val actionNames = context.resources.getTextArray(R.array.pen_wheel_action_names)
             val actionValues = context.resources.getTextArray(R.array.pen_wheel_action_values)
-            val colorNames = context.resources.getTextArray(R.array.pen_wheel_color_names)
-            val colorValues = context.resources.getTextArray(R.array.pen_wheel_color_values)
 
             for (index in 1..count) {
-                val slot = PenWheelSlotCategory(context).apply {
-                    key = "pen_wheel_slot_category_$index"
-                    title = context.getString(R.string.title_pen_wheel_slot_group, index)
-                    order = 10 + index * 10
-                    canRemove = count > PreferenceConfiguration.MIN_PEN_WHEEL_COUNT
-                    onRemove = {
-                        removePenWheelSlot(prefs, index)
-                        rebuildPenWheelSlots()
-                    }
-                }
-
                 seedPenWheelValue(
                     prefs,
                     "list_pen_wheel_slot_$index",
@@ -5003,10 +5003,20 @@ class StreamSettings : ThemedAppCompatActivity() {
                 )
                 seedPenWheelValue(prefs, "list_pen_wheel_color_$index", PenWheelColor.DEFAULT.prefValue)
 
+                val slot = PenWheelSlotCategory(context).apply {
+                    key = "pen_wheel_slot_category_$index"
+                    title = context.getString(R.string.title_pen_wheel_slot_group, index)
+                    order = index * 10
+                    canRemove = count > PreferenceConfiguration.MIN_PEN_WHEEL_COUNT
+                    onRemove = {
+                        removePenWheelSlot(prefs, index)
+                        rebuildPenWheelSlots()
+                    }
+                }
+
                 // Attach the group before adding children: a Preference can only
                 // take children once it has a PreferenceManager.
-                category.addPreference(slot)
-                penWheelSlotCategories += slot
+                screen.addPreference(slot)
 
                 slot.addPreference(PenWheelListPreference(context).apply {
                     key = "list_pen_wheel_slot_$index"
@@ -5016,27 +5026,23 @@ class StreamSettings : ThemedAppCompatActivity() {
                     setEntries(actionNames)
                     setEntryValues(actionValues)
                 })
-                slot.addPreference(PenWheelListPreference(context).apply {
+                slot.addPreference(PenWheelColorPreference(context).apply {
                     key = "list_pen_wheel_color_$index"
                     order = 1
                     title = context.getString(R.string.title_pen_wheel_color)
-                    setDescription(context.getString(R.string.summary_pen_wheel_color))
-                    setEntries(colorNames)
-                    setEntryValues(colorValues)
                 })
             }
 
-            category.addPreference(Preference(context).apply {
+            // Adding a slot is the main action of this screen, so it gets a
+            // category-sized title instead of the small one a normal row uses.
+            screen.addPreference(Preference(context).apply {
                 key = penWheelAddSlotKey
+                layoutResource = R.layout.preference_action_big_title
                 isPersistent = false
-                order = 10 + (count + 1) * 10
+                order = (count + 1) * 10
                 title = context.getString(R.string.title_pen_wheel_add_slot)
-                summary = context.getString(
-                    R.string.summary_pen_wheel_add_slot,
-                    count,
-                    PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
-                )
-                isEnabled = count < PreferenceConfiguration.MAX_PEN_WHEEL_COUNT
+                summary = context.getString(R.string.summary_pen_wheel_add_slot, count, max)
+                isEnabled = count < max
                 onPreferenceClickListener = Preference.OnPreferenceClickListener {
                     addPenWheelSlot(prefs)
                     rebuildPenWheelSlots()

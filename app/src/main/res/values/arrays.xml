@@ -709,32 +709,7 @@
         <item>200</item><item>280</item><item>400</item><item>600</item>
     </string-array>
 
-    <string-array name="pen_wheel_count_names" translatable="false">
-        <item>3</item><item>4</item><item>5</item><item>6</item><item>7</item>
-        <item>8</item><item>9</item><item>10</item>
-    </string-array>
-    <string-array name="pen_wheel_count_values" translatable="false">
-        <item>3</item><item>4</item><item>5</item><item>6</item><item>7</item>
-        <item>8</item><item>9</item><item>10</item>
-    </string-array>
-
-    <string-array name="pen_wheel_color_names">
-        <item>@string/pen_wheel_color_amber</item>
-        <item>@string/pen_wheel_color_coral</item>
-        <item>@string/pen_wheel_color_crimson</item>
-        <item>@string/pen_wheel_color_rose</item>
-        <item>@string/pen_wheel_color_violet</item>
-        <item>@string/pen_wheel_color_blue</item>
-        <item>@string/pen_wheel_color_cyan</item>
-        <item>@string/pen_wheel_color_teal</item>
-        <item>@string/pen_wheel_color_green</item>
-        <item>@string/pen_wheel_color_lime</item>
-        <item>@string/pen_wheel_color_white</item>
-    </string-array>
-    <!-- Must stay in sync with PenWheelColor.prefValues. -->
-    <string-array name="pen_wheel_color_values" translatable="false">
-        <item>amber</item><item>coral</item><item>crimson</item><item>rose</item>
-        <item>violet</item><item>blue</item><item>cyan</item><item>teal</item>
-        <item>green</item><item>lime</item><item>white</item>
-    </string-array>
+    <!-- The colour list is not here on purpose: PenWheelColorPreference builds
+         its swatches straight from PenWheelColor, so an array of names would
+         duplicate the enum and drift out of sync with it. -->
 </resources>
