@@ -35,7 +35,8 @@ class PenButtonController(
         /** Open the wheel centred on the given screen point. */
         fun showWheel(centerX: Float, centerY: Float, radius: Float)
         fun updateSelection(index: Int)
-        fun hideWheel()
+        /** @param committedIndex the chosen slot, or -1 when the gesture was cancelled. */
+        fun hideWheel(committedIndex: Int)
         fun fire(action: PenWheelAction)
     }
 
@@ -213,16 +214,16 @@ class PenButtonController(
         }
     }
 
-    private fun dismissWheel() {
+    private fun dismissWheel(committedIndex: Int = -1) {
         handler.removeCallbacks(autoClose)
         wheelOpen = false
         selection = -1
-        listener.hideWheel()
+        listener.hideWheel(committedIndex)
     }
 
     private fun commit() {
         val index = selection
-        dismissWheel()
+        dismissWheel(index)
         if (index in slots.indices) {
             val action = slots[index]
             if (action.sendsKey) listener.fire(action)

@@ -4,7 +4,6 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -13,6 +12,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -22,6 +22,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -43,7 +44,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
-private val WheelScrim = Color.Black.copy(alpha = 0.42f)
 private val WheelBacking = Color(0xF01A1714)
 private val WheelIdleSector = Color(0xFF26221E)
 private val WheelRim = Color(0x40FFE7C2)
@@ -63,8 +63,14 @@ private const val HUB_FRACTION = 0.27f
  * lights up, in the color configured for that slot. The controller selects by
  * angle alone, so the pen never has to land on a label.
  *
- * The opening animation is deliberately small -- a short scale pop, no spin.
- * A spinning wheel is tiring to look at every few seconds while drawing.
+ * There is no dimming scrim: the wheel is opaque enough on its own, and a
+ * full-screen mask that outlived the wheel read as a second, slower dismissal.
+ * The wheel gets a soft shadow instead so it still separates from a bright
+ * canvas.
+ *
+ * Dismissal is asymmetric by design: the wheel body (ring, hub, other sectors)
+ * is gone in the same frame, while the committed sector lingers for a slow fade
+ * so the eye follows the color that was actually picked.
  */
 @Composable
 internal fun PenWheelOverlay(
@@ -75,37 +81,56 @@ internal fun PenWheelOverlay(
     slots: List<PenWheelAction>,
     colors: List<Int>,
     selection: Int,
+    exitSector: Int,
     modifier: Modifier = Modifier
 ) {
     // Keep the wheel composed until its exit animation has finished.
     var present by remember { mutableStateOf(visible) }
-    val scrim = remember { Animatable(if (visible) 1f else 0f) }
+    var exiting by remember { mutableStateOf(false) }
     val content = remember { Animatable(if (visible) 1f else 0f) }
     val scale = remember { Animatable(1f) }
     val selBoost = remember { Animatable(1f) }
     val hubPop = remember { Animatable(1f) }
+    val exitAlpha = remember { Animatable(1f) }
+    val exitScale = remember { Animatable(1f) }
+    val exitLabelAlpha = remember { Animatable(1f) }
 
     LaunchedEffect(visible) {
         if (visible) {
             present = true
+            exiting = false
+            content.snapTo(0f)
             scale.snapTo(0.92f)
             hubPop.snapTo(0.78f)
-            content.snapTo(0f)
             coroutineScope {
-                launch { scrim.animateTo(1f, tween(90)) }
                 launch { content.animateTo(1f, tween(100)) }
                 launch { scale.animateTo(1f, spring(dampingRatio = 0.62f, stiffness = 520f)) }
                 launch { hubPop.animateTo(1f, spring(dampingRatio = 0.6f, stiffness = 520f)) }
             }
-        } else {
-            // Fade the wheel itself out as well: leaving it opaque and only
-            // fading the scrim makes the dismissal look like a hard cut.
+        } else if (exitSector in slots.indices) {
+            // Committed a sector: drop the body immediately, keep only that
+            // wedge and let it fade while drifting outward a little.
+            exiting = true
+            exitAlpha.snapTo(1f)
+            exitScale.snapTo(1f)
+            exitLabelAlpha.snapTo(1f)
+            delay(30)
             coroutineScope {
-                launch { scrim.animateTo(0f, tween(80)) }
-                launch { content.animateTo(0f, tween(80)) }
-                launch { scale.animateTo(0.96f, tween(80)) }
+                launch { exitAlpha.animateTo(0f, tween(260)) }
+                launch { exitScale.animateTo(1.06f, tween(260)) }
+                launch { exitLabelAlpha.animateTo(0f, tween(130)) }
             }
-            delay(80)
+            present = false
+            exiting = false
+        } else {
+            // Cancelled or timed out: pull the whole wheel back in. Nothing was
+            // chosen, so there is no sector worth lingering on.
+            if (!present) return@LaunchedEffect
+            exiting = false
+            coroutineScope {
+                launch { content.animateTo(0f, tween(140)) }
+                launch { scale.animateTo(0.92f, tween(140)) }
+            }
             present = false
         }
     }
@@ -131,17 +156,10 @@ internal fun PenWheelOverlay(
     val rimStroke = remember(density) { Stroke(width = with(density) { 1.5.dp.toPx() }) }
     val chosenStroke = remember(density) { Stroke(width = with(density) { 2.dp.toPx() }) }
 
-    // The scrim fades through graphicsLayer, not through Color.copy(alpha=..):
-    // reading an animated value while building the modifier recomposes this
-    // whole subtree every frame, which would re-run every slot's stringResource
-    // and re-layout ten full-size layers 60 times a second. The draw-phase
-    // lambda below only invalidates drawing.
-    Box(
-        modifier = modifier
-            .fillMaxSize()
-            .background(WheelScrim)
-            .graphicsLayer { alpha = scrim.value.coerceIn(0f, 1f) }
-    ) {
+    val exitingNow = !visible && exiting
+    val retracting = !visible && !exiting
+
+    Box(modifier = modifier.fillMaxSize()) {
         Box(
             modifier = Modifier
                 .offset {
@@ -151,10 +169,20 @@ internal fun PenWheelOverlay(
                     )
                 }
                 .size(diameter)
+                .then(
+                    // Only the full wheel casts a shadow; a lone fading wedge
+                    // with a circular shadow under it would look like a bug.
+                    if (visible || retracting) {
+                        Modifier.shadow(elevation = 24.dp, shape = CircleShape, clip = false)
+                    } else {
+                        Modifier
+                    }
+                )
                 .graphicsLayer {
-                    alpha = content.value
-                    scaleX = scale.value
-                    scaleY = scale.value
+                    alpha = if (exitingNow) 1f else content.value
+                    val s = if (exitingNow) exitScale.value else scale.value
+                    scaleX = s
+                    scaleY = s
                 }
         ) {
             Canvas(Modifier.fillMaxSize()) {
@@ -168,6 +196,34 @@ internal fun PenWheelOverlay(
                 // Precomputed rather than a per-index lambda: this runs on every
                 // draw, and a captured closure would allocate on each frame.
                 val baseAngle = -90f - slice / 2f + gap / 2f
+
+                if (exitingNow) {
+                    // Dismissal: only the committed wedge survives, fading.
+                    val chosen = exitSector
+                    if (chosen !in slots.indices) return@Canvas
+                    val alpha = exitAlpha.value.coerceIn(0f, 1f)
+                    val rr = r * 1.02f
+                    drawArc(
+                        color = slotColor(chosen, colors),
+                        startAngle = baseAngle + chosen * slice,
+                        sweepAngle = slice - gap,
+                        useCenter = true,
+                        topLeft = Offset(c.x - rr, c.y - rr),
+                        size = Size(rr * 2f, rr * 2f),
+                        alpha = alpha
+                    )
+                    drawArc(
+                        color = WheelRimStrong,
+                        startAngle = baseAngle + chosen * slice,
+                        sweepAngle = slice - gap,
+                        useCenter = true,
+                        topLeft = Offset(c.x - rr, c.y - rr),
+                        size = Size(rr * 2f, rr * 2f),
+                        style = chosenStroke,
+                        alpha = alpha
+                    )
+                    return@Canvas
+                }
 
                 drawCircle(WheelBacking, radius = r, center = c)
 
@@ -216,7 +272,10 @@ internal fun PenWheelOverlay(
             }
 
             slots.forEachIndexed { index, action ->
-                val selected = index == selection
+                val isExitChosen = exitingNow && index == exitSector
+                if (!visible && !retracting && !isExitChosen) return@forEachIndexed
+
+                val selected = index == selection || isExitChosen
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -247,6 +306,7 @@ internal fun PenWheelOverlay(
                                 // Ring text reads from the hub outwards; flip the
                                 // left half so it never ends up upside down.
                                 rotationZ = labelRotation(index, slots.size)
+                                alpha = if (exitingNow) exitLabelAlpha.value else 1f
                             }
                         )
                     }
@@ -254,55 +314,58 @@ internal fun PenWheelOverlay(
             }
         }
 
-        // The hub stays upright: only the label pops, the wheel never spins.
-        Box(
-            modifier = Modifier
-                .offset {
-                    IntOffset(
-                        (centerX - radiusPx).roundToInt(),
-                        (centerY - radiusPx).roundToInt()
-                    )
-                }
-                .size(diameter),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(
+        // The hub stays upright and is part of the body. It also takes part in
+        // the cancel retract, but never in the committed-wedge fade.
+        if (visible || retracting) {
+            Box(
                 modifier = Modifier
-                    .size(hubSize)
-                    .graphicsLayer {
-                        alpha = content.value
-                        scaleX = hubPop.value * scale.value
-                        scaleY = hubPop.value * scale.value
-                    },
-                horizontalAlignment = Alignment.CenterHorizontally
+                    .offset {
+                        IntOffset(
+                            (centerX - radiusPx).roundToInt(),
+                            (centerY - radiusPx).roundToInt()
+                        )
+                    }
+                    .size(diameter),
+                contentAlignment = Alignment.Center
             ) {
-                val chosen = selection
-                Text(
-                    text = if (chosen in slots.indices) {
-                        stringResource(slots[chosen].labelRes)
-                    } else {
-                        stringResource(R.string.pen_wheel_hub_cancel)
-                    },
-                    color = WheelText,
-                    fontSize = 13.sp,
-                    lineHeight = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    maxLines = 2
-                )
-                if (chosen in slots.indices && slots[chosen].sendsKey) {
+                Column(
+                    modifier = Modifier
+                        .size(hubSize)
+                        .graphicsLayer {
+                            alpha = content.value
+                            scaleX = hubPop.value * scale.value
+                            scaleY = hubPop.value * scale.value
+                        },
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    val chosen = selection
                     Text(
-                        text = slots[chosen].shortcutLabel(
-                            ctrlText = stringResource(R.string.pen_wheel_key_ctrl),
-                            shiftText = stringResource(R.string.pen_wheel_key_shift),
-                            altText = stringResource(R.string.pen_wheel_key_alt)
-                        ),
-                        color = WheelTextDim,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Medium,
+                        text = if (chosen in slots.indices) {
+                            stringResource(slots[chosen].labelRes)
+                        } else {
+                            stringResource(R.string.pen_wheel_hub_cancel)
+                        },
+                        color = WheelText,
+                        fontSize = 13.sp,
+                        lineHeight = 14.sp,
+                        fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center,
-                        maxLines = 1
+                        maxLines = 2
                     )
+                    if (chosen in slots.indices && slots[chosen].sendsKey) {
+                        Text(
+                            text = slots[chosen].shortcutLabel(
+                                ctrlText = stringResource(R.string.pen_wheel_key_ctrl),
+                                shiftText = stringResource(R.string.pen_wheel_key_shift),
+                                altText = stringResource(R.string.pen_wheel_key_alt)
+                            ),
+                            color = WheelTextDim,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Medium,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1
+                        )
+                    }
                 }
             }
         }

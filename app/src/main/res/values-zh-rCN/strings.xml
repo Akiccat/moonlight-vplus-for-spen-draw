@@ -2336,6 +2336,8 @@
     <string name="pen_button_hold_600">600 毫秒</string>
     <string name="summary_pen_wheel_slot">以快捷键形式发给电脑，所以绘图软件里能绑到按键上的功能都能用。</string>
     <string name="summary_pen_wheel_color">这个扇区被选中时显示的颜色；未选中时统一为深灰。</string>
+    <string name="pen_wheel_color_picker_hint">外圈选色相，内圈选明暗；也可以直接输入色值。</string>
+    <string name="pen_wheel_color_hex_hint">输入 #RRGGBB</string>
     <string name="title_pen_wheel_slot_group">槽位 %1$d</string>
     <string name="title_pen_wheel_slot_action">工具</string>
     <string name="title_pen_wheel_color">颜色</string>

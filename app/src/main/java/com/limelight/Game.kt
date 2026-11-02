@@ -246,6 +246,8 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     private val penWheelCenterY = mutableStateOf(0f)
     private val penWheelRadius = mutableStateOf(220f)
     private val penWheelSelection = mutableStateOf(-1)
+    /** Slot that was committed, kept so the overlay can fade only that wedge. */
+    private val penWheelExitSector = mutableStateOf(-1)
     private val penWheelSlots = mutableStateOf(PenWheelAction.defaultSlots)
     private val penWheelColors = mutableStateOf(
         List(PenWheelAction.SLOT_COUNT) { PenWheelColor.DEFAULT.argb }
@@ -3336,6 +3338,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
                     slots = penWheelSlots.value,
                     colors = penWheelColors.value,
                     selection = penWheelSelection.value,
+                    exitSector = penWheelExitSector.value,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -3369,6 +3372,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
                         penWheelCenterY.value = centerY
                         penWheelRadius.value = radius
                         penWheelSelection.value = -1
+                        penWheelExitSector.value = -1
                         penWheelVisible.value = true
                         penWheelView?.alpha = 1f
                         penWheelView?.visibility = View.VISIBLE
@@ -3380,19 +3384,23 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
                     runOnUiThread { penWheelSelection.value = index }
                 }
 
-                override fun hideWheel() {
+                override fun hideWheel(committedIndex: Int) {
                     runOnUiThread {
+                        penWheelExitSector.value = committedIndex
                         penWheelVisible.value = false
                         // Compose does not always repaint an emptied root, which
                         // leaves the last frame of the wheel on screen. Fade the
-                        // whole layer out once the exit animation is done; alpha
+                        // whole layer out once the exit has finished; alpha
                         // avoids the relayout hitch that GONE causes mid-stream.
+                        // A committed wedge fades for 290 ms (30 + 260); a cancel
+                        // retracts in 140 ms.
+                        val hideDelay = if (committedIndex >= 0) 420L else 240L
                         val token = ++penWheelLayerToken
                         penWheelView?.postDelayed({
                             if (token == penWheelLayerToken && !penWheelVisible.value) {
                                 penWheelView?.alpha = 0f
                             }
-                        }, 300)
+                        }, hideDelay)
                     }
                 }
 

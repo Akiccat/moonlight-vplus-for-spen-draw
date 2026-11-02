@@ -2447,6 +2447,8 @@ Tap again to replace it.</string>
     <string name="pen_wheel_key_shift">Shift</string>
     <string name="pen_wheel_key_alt">Alt</string>
     <string name="summary_pen_wheel_color">Color of this sector while it is highlighted. Unselected sectors stay dark gray.</string>
+    <string name="pen_wheel_color_picker_hint">Outer ring picks hue, inner disc picks brightness — or type a hex value.</string>
+    <string name="pen_wheel_color_hex_hint">Enter #RRGGBB</string>
     <string name="title_pen_wheel_slot_group">Slot %1$d</string>
     <string name="title_pen_wheel_slot_action">Tool</string>
     <string name="title_pen_wheel_color">Color</string>

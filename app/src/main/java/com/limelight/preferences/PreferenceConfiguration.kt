@@ -1533,9 +1533,9 @@ class PreferenceConfiguration {
                 )
             }
             config.penWheelColors = (0 until slotCount).map { index ->
-                PenWheelColor.fromPref(
+                PenWheelColor.argbFromPref(
                     prefs.getString(PEN_WHEEL_COLOR_PREF_PREFIX + (index + 1), null)
-                ).argb
+                )
             }
             config.playHostAudio = prefs.getBoolean(HOST_AUDIO_PREF_STRING, DEFAULT_HOST_AUDIO)
             config.smallIconMode = prefs.getBoolean(SMALL_ICONS_PREF_STRING, getDefaultSmallMode(context))

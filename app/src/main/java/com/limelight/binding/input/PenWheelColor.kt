@@ -30,13 +30,32 @@ enum class PenWheelColor(
     companion object {
         val DEFAULT = AMBER
 
-        /** Values exposed as ListPreference entryValues, in display order. */
-        val prefValues: Array<String> = entries.map { it.prefValue }.toTypedArray()
-
-        /** Labels matching [prefValues], filled in by the caller (needs a Context). */
-        val labelResIds: Array<Int> = entries.map { it.labelRes }.toTypedArray()
-
         fun fromPref(value: String?): PenWheelColor =
             entries.firstOrNull { it.prefValue == value } ?: DEFAULT
+
+        /**
+         * Stored values are either a preset name or a custom `#RRGGBB` /
+         * `#AARRGGBB` string, so callers must not assume a preset was picked.
+         */
+        fun argbFromPref(value: String?): Int =
+            parseHex(value) ?: fromPref(value).argb
+
+        /** The preset with exactly this RGB, if the user happened to land on one. */
+        fun fromArgb(argb: Int): PenWheelColor? =
+            entries.firstOrNull { (it.argb and 0xFFFFFF) == (argb and 0xFFFFFF) }
+
+        fun parseHex(value: String?): Int? {
+            val hex = value?.trim()?.removePrefix("#") ?: return null
+            if (hex.length != 6 && hex.length != 8) return null
+            if (!hex.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) return null
+            val parsed = hex.toLongOrNull(16) ?: return null
+            return if (hex.length == 6) {
+                (0xFF000000L or parsed).toInt()
+            } else {
+                parsed.toInt()
+            }
+        }
+
+        fun hexForArgb(argb: Int): String = String.format("#%06X", argb and 0xFFFFFF)
     }
 }
