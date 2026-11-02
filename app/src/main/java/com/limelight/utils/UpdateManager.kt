@@ -53,6 +53,16 @@ object UpdateManager {
     private const val TAG = "UpdateManager"
     private const val UPDATE_CHECK_INTERVAL = 4 * 60 * 60 * 1000L
 
+    /**
+     * SuperSun is a local build on top of Moonlight V+.
+     *
+     * Pulling an upstream APK would replace this build (and its Sunshine-side
+     * features), so neither the startup check nor the settings entry may talk
+     * to the official release feed. Set this to true only when the build gains
+     * its own release channel.
+     */
+    private const val UPSTREAM_UPDATES_ENABLED = false
+
     // 仅用于设置页远程背景图，不参与版本检查或 APK 下载。
     private const val PROXY_DISCOVERY_URL = "https://ghproxy.link/js/src_views_home_HomeView_vue.js"
 
@@ -101,6 +111,16 @@ object UpdateManager {
     // ------------------------------------------------------------------
 
     fun checkForUpdates(context: Context, showToast: Boolean) {
+        if (!UPSTREAM_UPDATES_ENABLED) {
+            if (showToast) {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.toast_update_upstream_disabled),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            return
+        }
         enqueueUpdateCheck(context, showToast, enforceStartupInterval = false)
     }
 
@@ -136,7 +156,24 @@ object UpdateManager {
     }
 
     fun checkForUpdatesOnStartup(context: Context) {
+        if (!UPSTREAM_UPDATES_ENABLED) {
+            // A download started by an older build would still auto-install an
+            // upstream APK over this one; drop its bookkeeping on launch.
+            clearPendingDownloadState(context)
+            return
+        }
         enqueueUpdateCheck(context, showToast = false, enforceStartupInterval = true)
+    }
+
+    private fun clearPendingDownloadState(context: Context) {
+        context.getSharedPreferences("update_prefs", Context.MODE_PRIVATE).edit {
+            remove(PREF_DOWNLOAD_ID)
+                .remove(PREF_DOWNLOAD_APK_NAME)
+                .remove(PREF_DOWNLOAD_CANDIDATES)
+                .remove(PREF_DOWNLOAD_CANDIDATE_INDEX)
+                .remove(PREF_DOWNLOAD_SHA256)
+                .remove(PREF_DOWNLOAD_EXPECTED_SIZE)
+        }
     }
 
     /**

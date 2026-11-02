@@ -848,7 +848,7 @@
     <string name="about_dialog_no_browser">No external browser is available</string>
     <string name="about_dialog_choose_browser">Open with browser</string>
     <string name="check_for_updates">Check for updates</string>
-    <string name="summary_check_for_updates">Check if there is a new version available</string>
+    <string name="summary_check_for_updates">This build does not follow upstream releases</string>
 
     <!-- Toasts -->
     <string name="toast_controller_type_changed">Gamepad type may be changed due to motion sensor emulation</string>
@@ -1902,6 +1902,7 @@ Tap again to replace it.</string>
     <string name="toast_install_permission_denied">Install permission denied, download cancelled</string>
     <string name="toast_check_update_failed">Failed to check for updates, please try later</string>
     <string name="toast_already_latest_version">Already on latest version v%s</string>
+    <string name="toast_update_upstream_disabled">This is a local SuperSun build; upstream updates are not checked.</string>
     <string name="update_already_latest_title">Already Up to Date</string>
     <string name="update_btn_got_it">Got it</string>
     <string name="update_new_version_title">New Version Available</string>
